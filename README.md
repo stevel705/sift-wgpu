@@ -28,3 +28,18 @@ cargo run --release --example sift path/to/image.jpg
 - [Lowe, D. G. (1999). Object recognition from local scale-invariant features. The proceedings of the seventh IEEE international conference on computer vision, 2, 1150-1157.](https://www.cs.ubc.ca/~lowe/papers/iccv99.pdf)
 - [Lowe, D. G. (2004). SIFT: The scale invariant feature transform.](https://www.cs.ubc.ca/~lowe/keypoints/)
 
+
+## TODO
+
+- [ ] Implement SIFT
+- [ ] Add support for different image types
+- [ ] Add tests
+- [ ] Add documentation
+- [ ] Add examples
+- [ ] Add benchmarks
+- [ ] Add WASM support
+- [ ] Add WebGPU support
+
+## Legal Notice
+
+SIFT was patented, but it has expired. This repo is primarily meant for educational purposes, but feel free to use my code any way you want, commercial or otherwise. All I ask is that you cite or share this repo.

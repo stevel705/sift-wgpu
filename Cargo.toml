@@ -3,6 +3,16 @@ name = "sift-rs"
 version = "0.1.0"
 edition = "2021"
 authors = ["Alexandr Meshkov <stevel705@outlook.com>"]
+description = "SIFT implementation in Rust"
+license = "MIT"
+repository = "https://github.com/stevel705/sift-rs"
+readme = "README.md"
+keywords = ["sift", "feature-detection", "image-processing", "computer-vision"]
+categories = ["image-processing", "computer-vision"]
+documentation = "https://docs.rs/sift-rs"
+homepage = "https://github.com/stevel705/sift-rs"
+bugs = "https://github.com/stevel705/sift-rs/issues"
+
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
