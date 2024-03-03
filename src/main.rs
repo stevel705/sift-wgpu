@@ -1,47 +1,39 @@
-
-extern crate sift; use image::GrayImage;
-// not needed since Rust edition 2018
+use ::image::imageops::FilterType;
 use sift::*;
-
+// use ::image::DynamicImage;
 
 fn main() {
-    // let image_path = "./data/1.jpg";
-    // let gray_image = load_and_convert_image(image_path); // Шаг 1: Загрузка и преобразование в градации серого
-    // let resized_image = resize_image(&gray_image, 320, 240); // Изменение размера изображения
-    // let scales_per_octave = 3; // Количество масштабов (изображений) на октаву
-    // let num_octaves = 4; // Количество октав
-    // let initial_sigma = 1.6; // Начальное значение sigma для Гауссова размытия
-
-    // // Шаг 2: Построение масштабно-инвариантного пространства
-    // let scale_images = create_scale_images(&resized_image, num_octaves); // Создание изображений разных масштабов
-    // let blurred_images = apply_gaussian_blur_to_octave(&scale_images, scales_per_octave, initial_sigma); // Применение Гауссова размытия
+    let image_path = "./data/box.png";
+    let image = load_image(image_path); // Step 1: Load and convert the image to grayscale
+    let resized_image = image.resize(320, 240, FilterType::Gaussian).to_luma8(); // Resize the image to a power of 2
+    let scales_per_octave = 3; // Number of intervals in each octave
+    // let num_octaves = 4; // Number of octaves
+    let initial_sigma = 1.6; // Initial value of sigma for Gaussian blur
     
-    // for i in 0..blurred_images.len() {
-    //     let image = &blurred_images[i];
-    //     let path = format!("./data/octave_{}.jpg", i);
-    //     save_image(image, &path);
-    // }
-
-    let img1: GrayImage = load_and_convert_image("./data/circle.png");
-    let img2: GrayImage = load_and_convert_image("./data/star.png");
-
-    let substact_img = subtract(&img1, &img2);
-
-    save_image(&substact_img, "./data/substract.jpg");
     
-    // // Шаг 3: Вычисление DoG
-    // let dog_images = compute_dog(&blurred_images);
+    // // Step 2: Build scale-space pyramid of Gaussian images
+    let base_img = generate_base_image(&resized_image, initial_sigma, 1.0);
+    let num_octaves = compute_number_of_octaves((base_img.width(), base_img.height()));
+    let gaussian_kernels = generate_gaussian_kernels(initial_sigma, scales_per_octave);
+    let gaussian_images = generate_gaussian_images(&base_img, num_octaves, &gaussian_kernels);
     
-    // // Шаг 4: Поиск ключевых точек
+    // Step 3: Compute Difference of Gaussians
+    let dog_images = compute_dog(&gaussian_images); 
+    
+    // Step 4: Find local extrema
     // let keypoints = find_local_extrema(&dog_images);
 
-    // // Шаг 5: Вычисление градиентов и ориентаций
+    // // Step 5: Assign an orientation to each keypoint (optional) 
     // let (magnitudes, orientations) = compute_gradients(&gray_image);
     // let keypoints_with_orientations = assign_orientations(&keypoints, &magnitudes, &orientations, gray_image.width());
 
-    // // Шаг 6: Создание дескрипторов
+    // // Step 6: Generate descriptors for each keypoint
     // let descriptors = create_descriptors(&keypoints_with_orientations, &magnitudes, &orientations, gray_image.width());
 
     // // В этот момент `descriptors` содержит дескрипторы ключевых точек, которые могут быть использованы для сравнения с другими изображениями
     // println!("Generated {} descriptors for keypoints.", descriptors.len());
 }
+
+
+
+ 

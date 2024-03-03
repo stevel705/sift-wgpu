@@ -25,6 +25,21 @@ name = "sift"
 path = "src/main.rs"
 
 [dependencies]
-image = "0.24.8"
+image = "0.24.9"
 ndarray = "0.15.6"
 imageproc = "0.23.0"
+cv-core = { git = "https://github.com/rust-cv/cv.git" }
+log = { version = "0.4.14", default-features = false }
+primal = { version = "0.3.0", default-features = false }
+derive_more = { version = "0.99.17", default-features = false }
+nshare = { git = "https://github.com/rust-cv/nshare.git", rev = "cd4a5c007ecf4ef62c938a6ac64fd90edf895360", default-features = false, features = [
+    "ndarray",
+    "image",
+] }
+float-ord = { version = "0.3.2", default-features = false }
+space = "0.18.0"
+bitarray = "0.10.0"
+thiserror = { version = "1.0.40", default-features = false }
+wide = "0.7"
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+rayon = { version = "1.7.0", optional = true }

@@ -4,3 +4,7 @@
 .vscode
 *.jpg
 *.png
+*.jpeg
+*.tiff
+*.txt
+python/
