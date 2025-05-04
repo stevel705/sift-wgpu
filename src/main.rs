@@ -1,47 +1,74 @@
+// src/main.rs
 
-extern crate sift; use image::GrayImage;
-// not needed since Rust edition 2018
-use sift::*;
+// Используем имя библиотеки 'sift', а не имя пакета 'sift_rs'
+use image::Rgb;
+use sift::draw_keypoints_to_image; // Импортируем новую функцию
+use sift::sift::{load_image_dyn, Sift}; // Импортируем Rgb для указания цвета
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let image_path = "data/1.jpg";
 
-fn main() {
-    // let image_path = "./data/1.jpg";
-    // let gray_image = load_and_convert_image(image_path); // Шаг 1: Загрузка и преобразование в градации серого
-    // let resized_image = resize_image(&gray_image, 320, 240); // Изменение размера изображения
-    // let scales_per_octave = 3; // Количество масштабов (изображений) на октаву
-    // let num_octaves = 4; // Количество октав
-    // let initial_sigma = 1.6; // Начальное значение sigma для Гауссова размытия
+    if std::fs::create_dir_all("data").is_err() {
+        eprintln!(
+            "Warning: Could not create data directory. Ensure it exists or you have permissions."
+        );
+    }
 
-    // // Шаг 2: Построение масштабно-инвариантного пространства
-    // let scale_images = create_scale_images(&resized_image, num_octaves); // Создание изображений разных масштабов
-    // let blurred_images = apply_gaussian_blur_to_octave(&scale_images, scales_per_octave, initial_sigma); // Применение Гауссова размытия
-    
-    // for i in 0..blurred_images.len() {
-    //     let image = &blurred_images[i];
-    //     let path = format!("./data/octave_{}.jpg", i);
-    //     save_image(image, &path);
-    // }
+    println!("Loading image from: {}", image_path);
+    let img_dyn = match load_image_dyn(image_path) {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("Error loading image '{}': {}", image_path, e);
+            // ... (сообщения об ошибке) ...
+            return Err(e.into());
+        }
+    };
+    println!(
+        "Image loaded successfully: {}x{}",
+        img_dyn.width(),
+        img_dyn.height()
+    );
 
-    let img1: GrayImage = load_and_convert_image("./data/circle.png");
-    let img2: GrayImage = load_and_convert_image("./data/star.png");
+    // Используем параметры SIFT по умолчанию
+    let sift = Sift::default();
 
-    let substact_img = subtract(&img1, &img2);
+    println!("Detecting SIFT keypoints and computing descriptors...");
+    // Используем новый метод, возвращающий и точки, и дескрипторы
+    let (keypoints, descriptors) = sift.detect_and_compute(&img_dyn);
 
-    save_image(&substact_img, "./data/substract.jpg");
-    
-    // // Шаг 3: Вычисление DoG
-    // let dog_images = compute_dog(&blurred_images);
-    
-    // // Шаг 4: Поиск ключевых точек
-    // let keypoints = find_local_extrema(&dog_images);
+    println!("Found {} keypoints.", keypoints.len());
+    println!("Computed {} descriptors.", descriptors.len());
 
-    // // Шаг 5: Вычисление градиентов и ориентаций
-    // let (magnitudes, orientations) = compute_gradients(&gray_image);
-    // let keypoints_with_orientations = assign_orientations(&keypoints, &magnitudes, &orientations, gray_image.width());
+    if !keypoints.is_empty() {
+        // Выводим информацию о первой точке для примера
+        println!("Example keypoint [0]: x={:.2}, y={:.2}, size={:.2}, angle={:.2}, response={:.4}, octave={}, layer={}",
+                 keypoints[0].x, keypoints[0].y, keypoints[0].size, keypoints[0].angle.to_degrees(), // Угол в градусах для наглядности
+                 keypoints[0].response, keypoints[0].octave, keypoints[0].layer);
 
-    // // Шаг 6: Создание дескрипторов
-    // let descriptors = create_descriptors(&keypoints_with_orientations, &magnitudes, &orientations, gray_image.width());
+        // Выводим размер первого дескриптора
+        if !descriptors.is_empty() {
+            println!("Example descriptor [0] length: {}", descriptors[0].len());
+            // Можно вывести первые несколько значений дескриптора
+            // println!("Example descriptor [0] values (first 10): {:?}", &descriptors[0][..10.min(descriptors[0].len())]);
+        }
 
-    // // В этот момент `descriptors` содержит дескрипторы ключевых точек, которые могут быть использованы для сравнения с другими изображениями
-    // println!("Generated {} descriptors for keypoints.", descriptors.len());
+        // --- Визуализация ---
+        println!("Drawing keypoints on image...");
+        let color = Rgb([255u8, 0, 0]); // Красный цвет
+        let image_with_keypoints = draw_keypoints_to_image(&img_dyn, &keypoints, color);
+
+        let output_path = "data/output_with_keypoints.png";
+        println!("Saving image with keypoints to: {}", output_path);
+        if let Err(e) = image_with_keypoints.save(output_path) {
+            eprintln!("Error saving output image: {}", e);
+        } else {
+            println!("Output image saved successfully.");
+        }
+        // --- Конец Визуализации ---
+    } else {
+        println!("No keypoints found.");
+    }
+
+    println!("SIFT process finished.");
+    Ok(())
 }
