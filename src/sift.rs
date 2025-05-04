@@ -124,7 +124,7 @@ impl Sift {
     // Построение гауссовой пирамиды
     // base_image: начальное изображение для пирамиды (после предварительной обработки)
     // Возвращает: вектор октав, где каждая октава - это вектор размытых изображений GrayImage
-    fn generate_gaussian_pyramid(&self, base_image: &GrayImage) -> Vec<Vec<GrayImage>> {
+    pub(crate) fn generate_gaussian_pyramid(&self, base_image: &GrayImage) -> Vec<Vec<GrayImage>> {
         let mut pyramid = Vec::with_capacity(self.num_octaves as usize);
         let mut current_octave_base_image = base_image.clone();
         let k = 2.0_f32.powf(1.0 / self.num_intervals as f32);
@@ -177,7 +177,7 @@ impl Sift {
     // Построение пирамиды разностей гауссианов (DoG)
     // gaussian_pyramid: результат generate_gaussian_pyramid
     // Возвращает: вектор октав, где каждая октава - это вектор DoG изображений (Luma<f32>)
-    fn generate_dog_pyramid(
+    pub(crate) fn generate_dog_pyramid(
         &self,
         gaussian_pyramid: &[Vec<GrayImage>],
     ) -> Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> {
@@ -201,7 +201,7 @@ impl Sift {
 
     // Вспомогательная функция для получения значения пикселя (безопасная для границ)
     #[inline(always)]
-    fn get_pixel_value(img: &ImageBuffer<Luma<f32>, Vec<f32>>, x: i32, y: i32) -> f32 {
+    pub(crate) fn get_pixel_value(img: &ImageBuffer<Luma<f32>, Vec<f32>>, x: i32, y: i32) -> f32 {
         // Простая обработка границ - повторение крайнего пикселя
         let (width, height) = img.dimensions();
         let x_clamp = x.clamp(0, width as i32 - 1) as u32;
@@ -211,7 +211,7 @@ impl Sift {
 
     // Helper for Gaussian images (GrayImage -> f32)
     #[inline(always)]
-    fn get_gauss_pixel_value(img: &GrayImage, x: i32, y: i32) -> f32 {
+    pub(crate) fn get_gauss_pixel_value(img: &GrayImage, x: i32, y: i32) -> f32 {
         let (width, height) = img.dimensions();
         let x_clamp = x.clamp(0, width as i32 - 1) as u32;
         let y_clamp = y.clamp(0, height as i32 - 1) as u32;
@@ -219,7 +219,7 @@ impl Sift {
     }
 
     #[inline(always)]
-    fn get_gauss_pixel_bilinear(img: &GrayImage, x: f32, y: f32) -> f32 {
+    pub(crate) fn get_gauss_pixel_bilinear(img: &GrayImage, x: f32, y: f32) -> f32 {
         // Ensure coordinates are within valid range for interpolation
         // Allow slightly outside [0, width/height - 1] to handle border cases, clamp later.
         let x_floor = x.floor();
@@ -250,7 +250,7 @@ impl Sift {
     }
 
     /// Уточняет положение экстремумов, отфильтровывает точки с низким контрастом и точки на краях.
-    fn refine_and_filter_extrema(
+    pub(crate) fn refine_and_filter_extrema(
         &self,
         initial_keypoints: &[KeyPoint],
         dog_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
@@ -461,7 +461,7 @@ impl Sift {
     // Возвращает: вектор кандидатов в ключевые точки
     /// Находит начальные кандидаты в ключевые точки (экстремумы DoG).
     /// Возвращает `KeyPoint` с целочисленными координатами и слоем.
-    fn find_scale_space_extrema(
+    pub(crate) fn find_scale_space_extrema(
         &self,
         dog_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
     ) -> Vec<KeyPoint> {
@@ -554,7 +554,7 @@ impl Sift {
         initial_keypoints
     }
 
-    fn assign_orientations(
+    pub(crate) fn assign_orientations(
         &self,
         keypoints: &[KeyPoint],
         gaussian_pyramid: &[Vec<GrayImage>],
@@ -721,7 +721,7 @@ impl Sift {
     }
 
     /// Нормализует вектор и обрезает значения.
-    fn normalize_and_clip_descriptor(desc: &mut [f32]) {
+    pub(crate) fn normalize_and_clip_descriptor(desc: &mut [f32]) {
         let norm = desc.iter().map(|&x| x * x).sum::<f32>().sqrt();
         if norm < 1e-8 {
             // Избегаем деления на ноль
@@ -913,7 +913,6 @@ impl Sift {
         };
 
         // 3. Build Gaussian pyramid
-        // Эту пирамиду будем использовать и для ориентации, и для дескрипторов
         let gaussian_pyramid = self.generate_gaussian_pyramid(&base_image);
 
         // 4. Build Difference-of-Gaussians (DoG) pyramid
@@ -940,7 +939,7 @@ impl Sift {
     }
 }
 
-// Вспомогательные публичные функции (можно оставить в lib.rs или здесь и реэкспортировать)
+// Utility functions
 pub fn load_image_dyn(path: &str) -> Result<DynamicImage, image::ImageError> {
     image::open(path)
 }
@@ -949,8 +948,8 @@ pub fn save_gray_image(image: &GrayImage, path: &str) -> Result<(), image::Image
     image.save(path)
 }
 
-// Вспомогательная функция для визуализации DoG изображений (Luma<f32>)
-// Нормализует значения к диапазону [0, 255] и сохраняет как GrayImage
+// Helper function for visualizing DoG images (Luma<f32>)
+// Normalizes values to the range [0, 255] and saves as a GrayImage
 pub fn convert_f32_to_grayimage_normalized(
     img_f32: &ImageBuffer<Luma<f32>, Vec<f32>>,
 ) -> GrayImage {
@@ -998,8 +997,8 @@ pub fn convert_f32_to_grayimage_normalized(
 
 #[cfg(test)]
 mod tests {
-    use super::*; // Импортируем все из родительского модуля
-    use image::GrayImage; // Нужен для теста билинейной интерполяции
+    use super::*;
+    use image::GrayImage;
 
     #[test]
     fn test_solve_linear_system_solvable() {

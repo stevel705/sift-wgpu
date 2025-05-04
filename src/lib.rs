@@ -1,7 +1,9 @@
+pub mod gpu_sift;
 pub mod keypoints;
 pub mod sift;
 
 // Реэкспорт основных типов
+pub use gpu_sift::sift_detect_and_compute_gpu;
 pub use keypoints::KeyPoint;
 pub use sift::{convert_f32_to_grayimage_normalized, load_image_dyn, save_gray_image, Sift};
 
