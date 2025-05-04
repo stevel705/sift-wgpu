@@ -1,6 +1,7 @@
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::filter::gaussian_blur_f32;
+use rayon::prelude::*;
 use std::f32::consts::PI;
 
 use crate::keypoints::KeyPoint;
@@ -553,158 +554,127 @@ impl Sift {
         initial_keypoints
     }
 
-    /// Назначает ориентации ключевым точкам.
     fn assign_orientations(
         &self,
         keypoints: &[KeyPoint],
         gaussian_pyramid: &[Vec<GrayImage>],
     ) -> Vec<KeyPoint> {
-        let mut oriented_keypoints = Vec::new();
+        // Используем parallel iterator от Rayon
+        // collect() соберет результаты из разных потоков
+        // flat_map используется, т.к. одна входная точка может породить несколько выходных (с разными углами)
+        keypoints
+            .par_iter() // <--- Заменяем iter() на par_iter()
+            .flat_map(|kp| {
+                let mut oriented_keypoints_for_this_kp = Vec::new(); // Локальный вектор для точки
+                let octave_idx = kp.octave as usize;
+                let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
 
-        for kp in keypoints {
-            let octave_idx = kp.octave as usize;
-            // Индекс слоя в Гауссовой пирамиде соответствует слою DoG.
-            // kp.layer - это округленный *интерполированный* слой. Убедимся, что он в границах Гауссовой пирамиды.
-            // Гауссова пирамида имеет num_intervals + 3 слоев (индексы 0..=num_intervals+2)
-            let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
-
-            // Проверка границ октавы и слоя
-            if octave_idx >= gaussian_pyramid.len()
-                || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
-            {
-                // eprintln!("Warning: Keypoint octave/layer index out of bounds for Gaussian pyramid. Skipping orientation assignment. KP: {:?}", kp);
-                continue; // Пропускаем точку, если индекс слоя выходит за пределы
-            }
-
-            let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
-            let (img_width, img_height) = gauss_image.dimensions();
-            let scale_factor = 2.0_f32.powi(kp.octave);
-
-            // Координаты точки в масштабе текущей октавы
-            let x_octave = kp.x / scale_factor;
-            let y_octave = kp.y / scale_factor;
-
-            // Sigma точки в масштабе текущей октавы
-            // kp.size - это абсолютная sigma. Sigma в октаве = kp.size / scale_factor
-            let sigma_octave = kp.size / scale_factor;
-            // Убедимся что sigma_octave положительная
-            if sigma_octave <= 0.0 {
-                // eprintln!("Warning: Non-positive sigma_octave encountered ({}) for KP: {:?}", sigma_octave, kp);
-                continue;
-            }
-
-            // Радиус окна для сбора градиентов
-            let window_radius = (ORIENTATION_WINDOW_RADIUS_FACTOR
-                * ORIENTATION_GAUSSIAN_EXPANSION_FACTOR
-                * sigma_octave)
-                .round() as i32;
-            // Sigma для гауссова взвешивания магнитуд
-            let weight_sigma = ORIENTATION_GAUSSIAN_EXPANSION_FACTOR * sigma_octave;
-            let weight_denom = 2.0 * weight_sigma * weight_sigma;
-
-            let mut hist = [0.0f32; ORIENTATION_HIST_BINS];
-
-            // Итерация по окну вокруг точки
-            for dy in -window_radius..=window_radius {
-                for dx in -window_radius..=window_radius {
-                    let x_img = (x_octave + dx as f32).round() as i32;
-                    let y_img = (y_octave + dy as f32).round() as i32;
-
-                    // Проверка, находимся ли внутри изображения (с запасом в 1 пиксель для градиентов)
-                    if x_img < 1
-                        || x_img >= (img_width - 1) as i32
-                        || y_img < 1
-                        || y_img >= (img_height - 1) as i32
-                    {
-                        continue;
-                    }
-
-                    // Вычисляем градиент в точке (x_img, y_img) на гауссовом изображении
-                    let grad_x = Self::get_gauss_pixel_value(gauss_image, x_img + 1, y_img)
-                        - Self::get_gauss_pixel_value(gauss_image, x_img - 1, y_img);
-                    let grad_y = Self::get_gauss_pixel_value(gauss_image, x_img, y_img + 1)
-                        - Self::get_gauss_pixel_value(gauss_image, x_img, y_img - 1);
-
-                    let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
-                    let angle = grad_y.atan2(grad_x); // Угол в радианах [-PI, PI]
-
-                    // Гауссов вес для магнитуды
-                    let weight =
-                        (-(dx as f32 * dx as f32 + dy as f32 * dy as f32) / weight_denom).exp();
-
-                    // Определяем бин гистограммы
-                    // Переводим угол в диапазон [0, 2*PI), затем в индекс бина
-                    let angle_normalized = if angle < 0.0 { angle + 2.0 * PI } else { angle };
-                    let bin_float = angle_normalized * (ORIENTATION_HIST_BINS as f32) / (2.0 * PI);
-                    let bin_idx = bin_float.floor() as usize % ORIENTATION_HIST_BINS; // % на случай точности float
-
-                    // Добавляем взвешенную магнитуду в бин (можно использовать интерполяцию бинов, но пока просто)
-                    hist[bin_idx] += magnitude * weight;
+                if octave_idx >= gaussian_pyramid.len()
+                    || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
+                {
+                    return oriented_keypoints_for_this_kp; // Возвращаем пустой вектор, если индекс вне границ
                 }
-            }
 
-            // Сглаживаем гистограмму (простое скользящее среднее)
-            let mut smoothed_hist = hist; // Копируем для работы
-            for _ in 0..ORIENTATION_SMOOTHING_ITERATIONS {
-                let prev_hist = smoothed_hist; // Копируем предыдущее состояние
+                let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
+                let (img_width, img_height) = gauss_image.dimensions();
+                let scale_factor = 2.0_f32.powi(kp.octave);
+                let x_octave = kp.x / scale_factor;
+                let y_octave = kp.y / scale_factor;
+                let sigma_octave = kp.size / scale_factor;
+
+                if sigma_octave <= 0.0 {
+                    return oriented_keypoints_for_this_kp;
+                }
+
+                let window_radius = (ORIENTATION_WINDOW_RADIUS_FACTOR
+                    * ORIENTATION_GAUSSIAN_EXPANSION_FACTOR
+                    * sigma_octave)
+                    .round() as i32;
+                let weight_sigma = ORIENTATION_GAUSSIAN_EXPANSION_FACTOR * sigma_octave;
+                let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                let mut hist = [0.0f32; ORIENTATION_HIST_BINS];
+
+                // --- Цикл построения гистограммы (остается последовательным внутри задачи) ---
+                for dy in -window_radius..=window_radius {
+                    for dx in -window_radius..=window_radius {
+                        let x_img = (x_octave + dx as f32).round() as i32;
+                        let y_img = (y_octave + dy as f32).round() as i32;
+                        if x_img < 1
+                            || x_img >= (img_width - 1) as i32
+                            || y_img < 1
+                            || y_img >= (img_height - 1) as i32
+                        {
+                            continue;
+                        }
+                        let grad_x = Self::get_gauss_pixel_value(gauss_image, x_img + 1, y_img)
+                            - Self::get_gauss_pixel_value(gauss_image, x_img - 1, y_img);
+                        let grad_y = Self::get_gauss_pixel_value(gauss_image, x_img, y_img + 1)
+                            - Self::get_gauss_pixel_value(gauss_image, x_img, y_img - 1);
+                        let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                        let angle = grad_y.atan2(grad_x);
+                        let weight =
+                            (-(dx as f32 * dx as f32 + dy as f32 * dy as f32) / weight_denom).exp();
+                        let angle_normalized = if angle < 0.0 { angle + 2.0 * PI } else { angle };
+                        let bin_float =
+                            angle_normalized * (ORIENTATION_HIST_BINS as f32) / (2.0 * PI);
+                        let bin_idx = bin_float.floor() as usize % ORIENTATION_HIST_BINS;
+                        hist[bin_idx] += magnitude * weight;
+                    }
+                }
+                // --- Конец цикла построения гистограммы ---
+
+                // --- Сглаживание и поиск пиков (последовательно) ---
+                let mut smoothed_hist = hist;
+                // ... (код сглаживания без изменений) ...
+                for _ in 0..ORIENTATION_SMOOTHING_ITERATIONS {
+                    let prev_hist = smoothed_hist;
+                    for i in 0..ORIENTATION_HIST_BINS {
+                        let prev_bin = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
+                        let next_bin = (i + 1) % ORIENTATION_HIST_BINS;
+                        smoothed_hist[i] =
+                            (prev_hist[prev_bin] + prev_hist[i] + prev_hist[next_bin]) / 3.0;
+                    }
+                }
+                hist = smoothed_hist;
+
+                let max_peak_val = hist.iter().fold(0.0_f32, |max, &val| max.max(val));
+                let peak_threshold = max_peak_val * ORIENTATION_PEAK_RATIO;
+
                 for i in 0..ORIENTATION_HIST_BINS {
-                    let prev_bin = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
-                    let next_bin = (i + 1) % ORIENTATION_HIST_BINS;
-                    // Простое среднее по 3 бинам
-                    smoothed_hist[i] =
-                        (prev_hist[prev_bin] + prev_hist[i] + prev_hist[next_bin]) / 3.0;
-                }
-            }
-            hist = smoothed_hist; // Используем сглаженную гистограмму
-
-            // Находим максимальный пик
-            let max_peak_val = hist.iter().fold(0.0_f32, |max, &val| max.max(val));
-
-            // Находим все пики >= threshold * max_peak_val
-            let peak_threshold = max_peak_val * ORIENTATION_PEAK_RATIO;
-
-            for i in 0..ORIENTATION_HIST_BINS {
-                let current_val = hist[i];
-                // Проверяем, является ли бин локальным максимумом и выше порога
-                if current_val >= peak_threshold {
-                    let prev_bin_idx = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
-                    let next_bin_idx = (i + 1) % ORIENTATION_HIST_BINS;
-                    let prev_val = hist[prev_bin_idx];
-                    let next_val = hist[next_bin_idx];
-
-                    if current_val > prev_val && current_val > next_val {
-                        // Это пик! Интерполируем его положение для более точного угла.
-                        // Используем параболическую интерполяцию по current_val, prev_val, next_val
-                        // Вершина параболы находится в x = 0.5 * (prev - next) / (prev - 2*current + next)
-                        let interpolated_offset =
-                            0.5 * (prev_val - next_val) / (prev_val - 2.0 * current_val + next_val);
-                        // Сдвиг от центра текущего бина [-0.5, 0.5]
-
-                        // Центр бина i в радианах
-                        let bin_center_angle =
-                            (i as f32 + 0.5) * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
-                        // Уточненный угол
-                        let interpolated_angle = bin_center_angle
-                            + interpolated_offset * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
-
-                        // Нормализуем угол в диапазон [-PI, PI]
-                        let final_angle = interpolated_angle.rem_euclid(2.0 * PI);
-                        let final_angle = if final_angle > PI {
-                            final_angle - 2.0 * PI
-                        } else {
-                            final_angle
-                        };
-
-                        // Создаем новую ключевую точку с этой ориентацией
-                        let mut new_kp = kp.clone();
-                        new_kp.angle = final_angle;
-                        oriented_keypoints.push(new_kp);
+                    let current_val = hist[i];
+                    if current_val >= peak_threshold {
+                        let prev_bin_idx = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
+                        let next_bin_idx = (i + 1) % ORIENTATION_HIST_BINS;
+                        let prev_val = hist[prev_bin_idx];
+                        let next_val = hist[next_bin_idx];
+                        if current_val > prev_val && current_val > next_val {
+                            let interp_denom = prev_val - 2.0 * current_val + next_val;
+                            let interpolated_offset = if interp_denom.abs() > 1e-5 {
+                                0.5 * (prev_val - next_val) / interp_denom
+                            } else {
+                                0.0
+                            };
+                            let bin_center_angle =
+                                (i as f32 + 0.5) * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
+                            let interpolated_angle = bin_center_angle
+                                + interpolated_offset * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
+                            let final_angle = interpolated_angle.rem_euclid(2.0 * PI);
+                            let final_angle = if final_angle > PI {
+                                final_angle - 2.0 * PI
+                            } else {
+                                final_angle
+                            };
+                            let mut new_kp = kp.clone();
+                            new_kp.angle = final_angle;
+                            oriented_keypoints_for_this_kp.push(new_kp); // Добавляем в локальный вектор
+                        }
                     }
                 }
-            }
-        }
+                // --- Конец поиска пиков ---
 
-        oriented_keypoints
+                oriented_keypoints_for_this_kp // Возвращаем результат для этой точки
+            })
+            .collect() // Собираем результаты от всех потоков в один Vec<KeyPoint>
     }
 
     /// Обнаруживает ключевые точки SIFT на изображении.
@@ -784,183 +754,144 @@ impl Sift {
         gaussian_pyramid: &[Vec<GrayImage>],
         keypoints: &[KeyPoint],
     ) -> Vec<Vec<f32>> {
-        let mut descriptors = Vec::with_capacity(keypoints.len());
-        // Размерность дескриптора
         let desc_len = DESC_WINDOW_WIDTH * DESC_WINDOW_WIDTH * DESC_HIST_BINS;
 
-        for kp in keypoints {
-            let octave_idx = kp.octave as usize;
-            // Используем тот же слой Гауссовой пирамиды, что и для ориентации
-            let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
+        // Используем parallel iterator от Rayon
+        // map() преобразует каждую точку в дескриптор
+        keypoints
+            .par_iter() // <--- Заменяем iter() на par_iter()
+            .map(|kp| {
+                let mut hist = vec![0.0f32; desc_len]; // Локальная гистограмма для точки
+                let octave_idx = kp.octave as usize;
+                let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
 
-            // Проверки границ (дублирование из assign_orientations, но нужно и здесь)
-            if octave_idx >= gaussian_pyramid.len()
-                || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
-            {
-                eprintln!("Warning: Keypoint octave/layer index out of bounds for Gaussian pyramid during descriptor computation. Skipping KP: {:?}", kp);
-                descriptors.push(vec![0.0; desc_len]); // Добавляем нулевой дескриптор? Или пропускаем? Пока добавим нулевой.
-                continue;
-            }
+                // Проверка границ (если вне - возвращаем нулевой дескриптор)
+                if octave_idx >= gaussian_pyramid.len()
+                    || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
+                {
+                    // eprintln!("Warning: Keypoint octave/layer index out of bounds during descriptor computation. KP: {:?}", kp);
+                    return hist; // Возвращаем нулевой вектор
+                }
 
-            let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
-            let (img_width, img_height) = gauss_image.dimensions();
-            let scale_factor = 2.0_f32.powi(kp.octave);
+                let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
+                let (img_width, img_height) = gauss_image.dimensions();
+                let scale_factor = 2.0_f32.powi(kp.octave);
+                let x_octave = kp.x / scale_factor;
+                let y_octave = kp.y / scale_factor;
+                let sigma_octave = kp.size / scale_factor;
 
-            // Координаты точки в масштабе октавы
-            let x_octave = kp.x / scale_factor;
-            let y_octave = kp.y / scale_factor;
-            // Sigma точки в масштабе октавы
-            let sigma_octave = kp.size / scale_factor;
-            if sigma_octave <= 0.0 {
-                eprintln!("Warning: Non-positive sigma_octave encountered ({}) during descriptor computation for KP: {:?}", sigma_octave, kp);
-                descriptors.push(vec![0.0; desc_len]);
-                continue;
-            }
+                if sigma_octave <= 0.0 {
+                    // eprintln!("Warning: Non-positive sigma_octave encountered ({}) during descriptor computation for KP: {:?}", sigma_octave, kp);
+                    return hist; // Возвращаем нулевой вектор
+                }
 
-            // Угол точки (основная ориентация)
-            let angle = kp.angle;
-            let cos_a = angle.cos();
-            let sin_a = angle.sin();
+                let angle = kp.angle;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let bin_width_pixels = DESC_PATCH_SCALE_FACTOR * sigma_octave;
+                let window_width_pixels = bin_width_pixels * (DESC_WINDOW_WIDTH as f32);
+                let weight_sigma = 0.5 * window_width_pixels;
+                let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                let sample_radius = (window_width_pixels * 2.0f32.sqrt() * 0.5).ceil() as i32;
 
-            // Размер сетки дескриптора в пикселях изображения октавы
-            // Ширина одного "бина" сетки дескриптора (например, 4x4)
-            let bin_width_pixels = DESC_PATCH_SCALE_FACTOR * sigma_octave;
-            // Полная ширина окна дескриптора (включает половину крайних бинов с каждой стороны)
-            let window_width_pixels = bin_width_pixels * (DESC_WINDOW_WIDTH as f32);
-            // Гауссова сигма для взвешивания = половина ширины окна
-            let weight_sigma = 0.5 * window_width_pixels;
-            let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                // --- Цикл построения гистограммы дескриптора (последовательный внутри задачи) ---
+                for dy_img in -sample_radius..=sample_radius {
+                    for dx_img in -sample_radius..=sample_radius {
+                        let px = dx_img as f32;
+                        let py = dy_img as f32;
+                        let rx = cos_a * px + sin_a * py;
+                        let ry = -sin_a * px + cos_a * py;
+                        let x_bin_cont =
+                            rx / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
+                        let y_bin_cont =
+                            ry / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
 
-            // 3D гистограмма: desc_w x desc_w x desc_bins
-            let mut hist = vec![0.0f32; desc_len];
-
-            // Радиус области сэмплирования (достаточный, чтобы покрыть повернутое окно)
-            // Берем половину диагонали окна + запас
-            let sample_radius = (window_width_pixels * 2.0f32.sqrt() * 0.5).ceil() as i32;
-
-            // Итерация по пикселям в области сэмплирования вокруг точки
-            for dy_img in -sample_radius..=sample_radius {
-                for dx_img in -sample_radius..=sample_radius {
-                    // 1. Координаты пикселя (px, py) относительно точки в масштабе октавы
-                    let px = dx_img as f32;
-                    let py = dy_img as f32;
-
-                    // 2. Поворот координат на -angle, чтобы перейти в систему координат дескриптора
-                    // Координаты (rx, ry) в повернутой системе, центр в точке
-                    let rx = cos_a * px + sin_a * py;
-                    let ry = -sin_a * px + cos_a * py;
-
-                    // 3. Вычисление позиции этого пикселя в сетке дескриптора (в координатах бинов)
-                    // Координаты нормированы так, что 1 единица = bin_width_pixels
-                    // Центр сетки дескриптора в (0, 0) в повернутой системе
-                    // Сетка [-win/2, win/2] x [-win/2, win/2], где win = DESC_WINDOW_WIDTH
-                    let x_bin_cont = rx / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
-                    let y_bin_cont = ry / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
-
-                    // 4. Проверка, попадает ли точка в область влияния сетки (с запасом в 1 бин для интерполяции)
-                    if x_bin_cont > -1.0
-                        && x_bin_cont < (DESC_WINDOW_WIDTH as f32)
-                        && y_bin_cont > -1.0
-                        && y_bin_cont < (DESC_WINDOW_WIDTH as f32)
-                    {
-                        // 5. Вычисляем градиент в точке (x_octave + px, y_octave + py)
-                        // Используем интерполированные значения для большей точности
-                        let x_sample = x_octave + px;
-                        let y_sample = y_octave + py;
-
-                        // Проверка границ перед интерполяцией градиента
-                        if x_sample < 0.0
-                            || x_sample >= (img_width - 1) as f32
-                            || y_sample < 0.0
-                            || y_sample >= (img_height - 1) as f32
+                        if x_bin_cont > -1.0
+                            && x_bin_cont < (DESC_WINDOW_WIDTH as f32)
+                            && y_bin_cont > -1.0
+                            && y_bin_cont < (DESC_WINDOW_WIDTH as f32)
                         {
-                            continue;
-                        }
+                            let x_sample = x_octave + px;
+                            let y_sample = y_octave + py;
+                            if x_sample < 0.0
+                                || x_sample >= (img_width - 1) as f32
+                                || y_sample < 0.0
+                                || y_sample >= (img_height - 1) as f32
+                            {
+                                continue;
+                            }
 
-                        let grad_x =
-                            Self::get_gauss_pixel_bilinear(gauss_image, x_sample + 1.0, y_sample)
-                                - Self::get_gauss_pixel_bilinear(
-                                    gauss_image,
-                                    x_sample - 1.0,
-                                    y_sample,
-                                );
-                        let grad_y =
-                            Self::get_gauss_pixel_bilinear(gauss_image, x_sample, y_sample + 1.0)
-                                - Self::get_gauss_pixel_bilinear(
-                                    gauss_image,
-                                    x_sample,
-                                    y_sample - 1.0,
-                                );
+                            let grad_x = Self::get_gauss_pixel_bilinear(
+                                gauss_image,
+                                x_sample + 1.0,
+                                y_sample,
+                            ) - Self::get_gauss_pixel_bilinear(
+                                gauss_image,
+                                x_sample - 1.0,
+                                y_sample,
+                            );
+                            let grad_y = Self::get_gauss_pixel_bilinear(
+                                gauss_image,
+                                x_sample,
+                                y_sample + 1.0,
+                            ) - Self::get_gauss_pixel_bilinear(
+                                gauss_image,
+                                x_sample,
+                                y_sample - 1.0,
+                            );
+                            let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                            let pixel_angle = grad_y.atan2(grad_x);
+                            let angle_relative = (pixel_angle - angle).rem_euclid(2.0 * PI);
+                            let weight = (-(px * px + py * py) / weight_denom).exp();
+                            let weighted_mag = magnitude * weight;
+                            let angle_bin_cont =
+                                angle_relative * (DESC_HIST_BINS as f32) / (2.0 * PI);
+                            let x_bin_idx = x_bin_cont.floor() as i32;
+                            let y_bin_idx = y_bin_cont.floor() as i32;
+                            let angle_bin_idx = angle_bin_cont.floor() as i32;
+                            let dx_interp = x_bin_cont - x_bin_idx as f32;
+                            let dy_interp = y_bin_cont - y_bin_idx as f32;
+                            let da_interp = angle_bin_cont - angle_bin_idx as f32;
 
-                        let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
-                        let pixel_angle = grad_y.atan2(grad_x); // [-PI, PI]
-
-                        // 6. Вычисляем ориентацию градиента относительно основной ориентации точки
-                        let angle_relative = (pixel_angle - angle).rem_euclid(2.0 * PI); // [0, 2*PI)
-
-                        // 7. Гауссов вес (зависит от расстояния в *неповернутой* системе координат)
-                        let weight = (-(px * px + py * py) / weight_denom).exp();
-                        let weighted_mag = magnitude * weight;
-
-                        // 8. Вычисляем позицию в бинах ориентации
-                        let angle_bin_cont = angle_relative * (DESC_HIST_BINS as f32) / (2.0 * PI);
-
-                        // 9. Трилинейная интерполяция для распределения weighted_mag по 8 соседним бинам
-                        let x_bin_idx = x_bin_cont.floor() as i32;
-                        let y_bin_idx = y_bin_cont.floor() as i32;
-                        let angle_bin_idx = angle_bin_cont.floor() as i32;
-
-                        let dx_interp = x_bin_cont - x_bin_idx as f32;
-                        let dy_interp = y_bin_cont - y_bin_idx as f32;
-                        let da_interp = angle_bin_cont - angle_bin_idx as f32;
-
-                        // Итерация по 8 соседним бинам (2x2x2)
-                        for i in 0..2 {
-                            // Смещение по X
-                            for j in 0..2 {
-                                // Смещение по Y
-                                for k in 0..2 {
-                                    // Смещение по Angle
-                                    let ix = x_bin_idx + i;
-                                    let iy = y_bin_idx + j;
-                                    let ia = (angle_bin_idx + k).rem_euclid(DESC_HIST_BINS as i32); // Цикличность по углу
-
-                                    // Проверка, что пространственные индексы в пределах сетки [0, W-1]
-                                    if ix >= 0
-                                        && ix < DESC_WINDOW_WIDTH as i32
-                                        && iy >= 0
-                                        && iy < DESC_WINDOW_WIDTH as i32
-                                    {
-                                        let weight_x =
-                                            if i == 0 { 1.0 - dx_interp } else { dx_interp };
-                                        let weight_y =
-                                            if j == 0 { 1.0 - dy_interp } else { dy_interp };
-                                        let weight_a =
-                                            if k == 0 { 1.0 - da_interp } else { da_interp };
-
-                                        let contribution =
-                                            weighted_mag * weight_x * weight_y * weight_a;
-
-                                        // Индекс в 1D векторе гистограммы
-                                        let hist_index = (iy * DESC_WINDOW_WIDTH as i32 + ix)
-                                            * DESC_HIST_BINS as i32
-                                            + ia;
-                                        hist[hist_index as usize] += contribution;
+                            for i in 0..2 {
+                                for j in 0..2 {
+                                    for k in 0..2 {
+                                        let ix = x_bin_idx + i;
+                                        let iy = y_bin_idx + j;
+                                        let ia =
+                                            (angle_bin_idx + k).rem_euclid(DESC_HIST_BINS as i32);
+                                        if ix >= 0
+                                            && ix < DESC_WINDOW_WIDTH as i32
+                                            && iy >= 0
+                                            && iy < DESC_WINDOW_WIDTH as i32
+                                        {
+                                            let weight_x =
+                                                if i == 0 { 1.0 - dx_interp } else { dx_interp };
+                                            let weight_y =
+                                                if j == 0 { 1.0 - dy_interp } else { dy_interp };
+                                            let weight_a =
+                                                if k == 0 { 1.0 - da_interp } else { da_interp };
+                                            let contribution =
+                                                weighted_mag * weight_x * weight_y * weight_a;
+                                            let hist_index = (iy * DESC_WINDOW_WIDTH as i32 + ix)
+                                                * DESC_HIST_BINS as i32
+                                                + ia;
+                                            hist[hist_index as usize] += contribution;
+                                            // Обновляем локальную hist
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
+                // --- Конец цикла построения гистограммы ---
 
-            // 10. Нормализация и обрезка дескриптора
-            Self::normalize_and_clip_descriptor(&mut hist);
-
-            descriptors.push(hist);
-        }
-
-        descriptors
+                // Нормализация локальной hist
+                Self::normalize_and_clip_descriptor(&mut hist);
+                hist // Возвращаем готовый дескриптор для этой точки
+            })
+            .collect() // Собираем результаты от всех потоков в один Vec<Vec<f32>>
     }
 
     /// Полный процесс SIFT: обнаружение и вычисление дескрипторов.

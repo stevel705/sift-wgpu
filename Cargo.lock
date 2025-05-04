@@ -982,6 +982,7 @@ dependencies = [
  "image",
  "imageproc",
  "ndarray",
+ "rayon",
 ]
 
 [[package]]

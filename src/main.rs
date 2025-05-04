@@ -4,6 +4,7 @@
 use image::Rgb;
 use sift::draw_keypoints_to_image; // Импортируем новую функцию
 use sift::sift::{load_image_dyn, Sift}; // Импортируем Rgb для указания цвета
+use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let image_path = "data/1.jpg";
@@ -34,8 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Detecting SIFT keypoints and computing descriptors...");
     // Используем новый метод, возвращающий и точки, и дескрипторы
+    let start_time = Instant::now();
     let (keypoints, descriptors) = sift.detect_and_compute(&img_dyn);
+    let duration = start_time.elapsed();
 
+    println!("SIFT processing took: {:?}", duration); // <--- Вывод времени
     println!("Found {} keypoints.", keypoints.len());
     println!("Computed {} descriptors.", descriptors.len());
 
@@ -62,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = image_with_keypoints.save(output_path) {
             eprintln!("Error saving output image: {}", e);
         } else {
-            println!("Output image saved successfully.");
+            println!("PNG output image saved successfully.");
         }
         // --- Конец Визуализации ---
     } else {

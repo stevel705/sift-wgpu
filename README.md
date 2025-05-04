@@ -31,11 +31,11 @@ cargo run --release --example sift path/to/image.jpg
 
 ## TODO
 
-- [ ] Implement SIFT
-- [ ] Add support for different image types
-- [ ] Add tests
+- [x] Implement SIFT
+- [x] Add support for different image types
+- [x] Add tests
 - [ ] Add documentation
-- [ ] Add examples
+- [x] Add examples
 - [ ] Add benchmarks
 - [ ] Add WASM support
 - [ ] Add WebGPU support
