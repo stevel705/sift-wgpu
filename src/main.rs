@@ -46,6 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         img_dyn.width(),
         img_dyn.height()
     );
+    // let img_dyn = img_dyn.resize_exact(320, 240, FilterType::Lanczos3);
+    // println!(
+    //     "Image resized to: {}x{}",
+    //     img_dyn.width(),
+    //     img_dyn.height()
+    // );
     println!("Selected SIFT backend: {:?}", backend);
 
     // Используем параметры SIFT по умолчанию
@@ -81,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let color = Rgb([255u8, 0, 0]); // Красный цвет
         let image_with_keypoints = draw_keypoints_to_image(&img_dyn, &keypoints, color);
 
-        let output_path = "data/output_with_keypoints.png";
+        let output_path = format!("data/output_{:?}.png", backend);
         println!("Saving image with keypoints to: {}", output_path);
         if let Err(e) = image_with_keypoints.save(output_path) {
             eprintln!("Error saving output image: {}", e);

@@ -221,6 +221,18 @@ impl Sift {
     }
 
     #[inline(always)]
+    pub(crate) fn get_gauss_pixel_value_f32(
+        img: &ImageBuffer<Luma<f32>, Vec<f32>>,
+        x: i32,
+        y: i32,
+    ) -> f32 {
+        let (width, height) = img.dimensions();
+        let x_clamp = x.clamp(0, width as i32 - 1) as u32;
+        let y_clamp = y.clamp(0, height as i32 - 1) as u32;
+        img.get_pixel(x_clamp, y_clamp)[0]
+    }
+
+    #[inline(always)]
     pub(crate) fn get_gauss_pixel_bilinear(img: &GrayImage, x: f32, y: f32) -> f32 {
         // Ensure coordinates are within valid range for interpolation
         // Allow slightly outside [0, width/height - 1] to handle border cases, clamp later.
@@ -249,6 +261,36 @@ impl Sift {
             + q12 * (1.0 - dx) * dy
             + q22 * dx * dy;
         val
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_gauss_pixel_bilinear_f32(
+        img: &ImageBuffer<Luma<f32>, Vec<f32>>,
+        x: f32,
+        y: f32,
+    ) -> f32 {
+        let x_floor = x.floor();
+        let y_floor = y.floor();
+        let x_ceil = x_floor + 1.0;
+        let y_ceil = y_floor + 1.0;
+
+        let dx = x - x_floor;
+        let dy = y - y_floor;
+
+        let x0 = x_floor as i32;
+        let y0 = y_floor as i32;
+        let x1 = x_ceil as i32;
+        let y1 = y_ceil as i32;
+
+        let q11 = Self::get_gauss_pixel_value_f32(img, x0, y0);
+        let q21 = Self::get_gauss_pixel_value_f32(img, x1, y0);
+        let q12 = Self::get_gauss_pixel_value_f32(img, x0, y1);
+        let q22 = Self::get_gauss_pixel_value_f32(img, x1, y1);
+
+        q11 * (1.0 - dx) * (1.0 - dy)
+            + q21 * dx * (1.0 - dy)
+            + q12 * (1.0 - dx) * dy
+            + q22 * dx * dy
     }
 
     /// Уточняет положение экстремумов, отфильтровывает точки с низким контрастом и точки на краях.
@@ -679,6 +721,132 @@ impl Sift {
             .collect() // Собираем результаты от всех потоков в один Vec<KeyPoint>
     }
 
+    pub(crate) fn assign_orientations_f32(
+        &self,
+        keypoints: &[KeyPoint],
+        gaussian_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
+    ) -> Vec<KeyPoint> {
+        keypoints
+            .par_iter()
+            .flat_map(|kp| {
+                let mut oriented_keypoints_for_this_kp = Vec::new();
+                let octave_idx = kp.octave as usize;
+                let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
+
+                if octave_idx >= gaussian_pyramid.len()
+                    || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
+                {
+                    return oriented_keypoints_for_this_kp;
+                }
+
+                let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
+                let (img_width, img_height) = gauss_image.dimensions();
+                let scale_factor = 2.0_f32.powi(kp.octave);
+                let x_octave = kp.x / scale_factor;
+                let y_octave = kp.y / scale_factor;
+                let sigma_octave = kp.size / scale_factor;
+
+                if sigma_octave <= 0.0 {
+                    return oriented_keypoints_for_this_kp;
+                }
+
+                let window_radius = (ORIENTATION_WINDOW_RADIUS_FACTOR
+                    * ORIENTATION_GAUSSIAN_EXPANSION_FACTOR
+                    * sigma_octave)
+                    .round() as i32;
+                let weight_sigma = ORIENTATION_GAUSSIAN_EXPANSION_FACTOR * sigma_octave;
+                let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                let mut hist = [0.0f32; ORIENTATION_HIST_BINS];
+
+                for dy in -window_radius..=window_radius {
+                    for dx in -window_radius..=window_radius {
+                        let x_img = (x_octave + dx as f32).round() as i32;
+                        let y_img = (y_octave + dy as f32).round() as i32;
+                        if x_img < 1
+                            || x_img >= (img_width - 1) as i32
+                            || y_img < 1
+                            || y_img >= (img_height - 1) as i32
+                        {
+                            continue;
+                        }
+                        let grad_x =
+                            Self::get_gauss_pixel_value_f32(gauss_image, x_img + 1, y_img)
+                                - Self::get_gauss_pixel_value_f32(
+                                    gauss_image,
+                                    x_img - 1,
+                                    y_img,
+                                );
+                        let grad_y =
+                            Self::get_gauss_pixel_value_f32(gauss_image, x_img, y_img + 1)
+                                - Self::get_gauss_pixel_value_f32(
+                                    gauss_image,
+                                    x_img,
+                                    y_img - 1,
+                                );
+                        let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                        let angle = grad_y.atan2(grad_x);
+                        let weight =
+                            (-(dx as f32 * dx as f32 + dy as f32 * dy as f32) / weight_denom).exp();
+                        let angle_normalized = if angle < 0.0 { angle + 2.0 * PI } else { angle };
+                        let bin_float =
+                            angle_normalized * (ORIENTATION_HIST_BINS as f32) / (2.0 * PI);
+                        let bin_idx = bin_float.floor() as usize % ORIENTATION_HIST_BINS;
+                        hist[bin_idx] += magnitude * weight;
+                    }
+                }
+
+                // Сглаживание гистограммы
+                let mut smoothed_hist = hist;
+                for _ in 0..ORIENTATION_SMOOTHING_ITERATIONS {
+                    let prev_hist = smoothed_hist;
+                    for i in 0..ORIENTATION_HIST_BINS {
+                        let prev_bin = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
+                        let next_bin = (i + 1) % ORIENTATION_HIST_BINS;
+                        smoothed_hist[i] =
+                            (prev_hist[prev_bin] + prev_hist[i] + prev_hist[next_bin]) / 3.0;
+                    }
+                }
+                hist = smoothed_hist;
+
+                let max_peak_val = hist.iter().fold(0.0_f32, |max, &val| max.max(val));
+                let peak_threshold = max_peak_val * ORIENTATION_PEAK_RATIO;
+
+                for i in 0..ORIENTATION_HIST_BINS {
+                    let current_val = hist[i];
+                    if current_val >= peak_threshold {
+                        let prev_bin_idx = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
+                        let next_bin_idx = (i + 1) % ORIENTATION_HIST_BINS;
+                        let prev_val = hist[prev_bin_idx];
+                        let next_val = hist[next_bin_idx];
+                        if current_val > prev_val && current_val > next_val {
+                            let interp_denom = prev_val - 2.0 * current_val + next_val;
+                            let interpolated_offset = if interp_denom.abs() > 1e-5 {
+                                0.5 * (prev_val - next_val) / interp_denom
+                            } else {
+                                0.0
+                            };
+                            let bin_center_angle =
+                                (i as f32 + 0.5) * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
+                            let interpolated_angle = bin_center_angle
+                                + interpolated_offset * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
+                            let final_angle = interpolated_angle.rem_euclid(2.0 * PI);
+                            let final_angle = if final_angle > PI {
+                                final_angle - 2.0 * PI
+                            } else {
+                                final_angle
+                            };
+                            let mut new_kp = kp.clone();
+                            new_kp.angle = final_angle;
+                            oriented_keypoints_for_this_kp.push(new_kp);
+                        }
+                    }
+                }
+
+                oriented_keypoints_for_this_kp
+            })
+            .collect()
+    }
+
     /// Обнаруживает ключевые точки SIFT на изображении.
     pub fn detect(&self, img: &DynamicImage) -> Vec<KeyPoint> {
         // 1. Convert to grayscale
@@ -896,6 +1064,143 @@ impl Sift {
             .collect() // Собираем результаты от всех потоков в один Vec<Vec<f32>>
     }
 
+    /// Вычисляет дескрипторы SIFT, используя гауссову пирамиду в формате f32.
+    pub fn compute_f32(
+        &self,
+        gaussian_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
+        keypoints: &[KeyPoint],
+    ) -> Vec<Vec<f32>> {
+        let desc_len = DESC_WINDOW_WIDTH * DESC_WINDOW_WIDTH * DESC_HIST_BINS;
+
+        keypoints
+            .par_iter()
+            .map(|kp| {
+                let mut hist = vec![0.0f32; desc_len];
+                let octave_idx = kp.octave as usize;
+                let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
+
+                if octave_idx >= gaussian_pyramid.len()
+                    || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
+                {
+                    return hist;
+                }
+
+                let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
+                let (img_width, img_height) = gauss_image.dimensions();
+                let scale_factor = 2.0_f32.powi(kp.octave);
+                let x_octave = kp.x / scale_factor;
+                let y_octave = kp.y / scale_factor;
+                let sigma_octave = kp.size / scale_factor;
+
+                if sigma_octave <= 0.0 {
+                    return hist;
+                }
+
+                let angle = kp.angle;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let bin_width_pixels = DESC_PATCH_SCALE_FACTOR * sigma_octave;
+                let window_width_pixels = bin_width_pixels * (DESC_WINDOW_WIDTH as f32);
+                let weight_sigma = 0.5 * window_width_pixels;
+                let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                let sample_radius = (window_width_pixels * 2.0f32.sqrt() * 0.5).ceil() as i32;
+
+                for dy_img in -sample_radius..=sample_radius {
+                    for dx_img in -sample_radius..=sample_radius {
+                        let px = dx_img as f32;
+                        let py = dy_img as f32;
+                        let rx = cos_a * px + sin_a * py;
+                        let ry = -sin_a * px + cos_a * py;
+                        let x_bin_cont =
+                            rx / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
+                        let y_bin_cont =
+                            ry / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
+
+                        if x_bin_cont > -1.0
+                            && x_bin_cont < (DESC_WINDOW_WIDTH as f32)
+                            && y_bin_cont > -1.0
+                            && y_bin_cont < (DESC_WINDOW_WIDTH as f32)
+                        {
+                            let x_sample = x_octave + px;
+                            let y_sample = y_octave + py;
+                            if x_sample < 0.0
+                                || x_sample >= (img_width - 1) as f32
+                                || y_sample < 0.0
+                                || y_sample >= (img_height - 1) as f32
+                            {
+                                continue;
+                            }
+
+                            let grad_x = Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample + 1.0,
+                                y_sample,
+                            ) - Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample - 1.0,
+                                y_sample,
+                            );
+                            let grad_y = Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample,
+                                y_sample + 1.0,
+                            ) - Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample,
+                                y_sample - 1.0,
+                            );
+                            let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                            let pixel_angle = grad_y.atan2(grad_x);
+                            let angle_relative = (pixel_angle - angle).rem_euclid(2.0 * PI);
+                            let weight = (-(px * px + py * py) / weight_denom).exp();
+                            let weighted_mag = magnitude * weight;
+                            let angle_bin_cont =
+                                angle_relative * (DESC_HIST_BINS as f32) / (2.0 * PI);
+                            let x_bin_idx = x_bin_cont.floor() as i32;
+                            let y_bin_idx = y_bin_cont.floor() as i32;
+                            let angle_bin_idx = angle_bin_cont.floor() as i32;
+                            let dx_interp = x_bin_cont - x_bin_idx as f32;
+                            let dy_interp = y_bin_cont - y_bin_idx as f32;
+                            let da_interp = angle_bin_cont - angle_bin_idx as f32;
+
+                            for i in 0..2 {
+                                for j in 0..2 {
+                                    for k in 0..2 {
+                                        let ix = x_bin_idx + i;
+                                        let iy = y_bin_idx + j;
+                                        let ia =
+                                            (angle_bin_idx + k).rem_euclid(DESC_HIST_BINS as i32);
+                                        if ix >= 0
+                                            && ix < DESC_WINDOW_WIDTH as i32
+                                            && iy >= 0
+                                            && iy < DESC_WINDOW_WIDTH as i32
+                                        {
+                                            let weight_x =
+                                                if i == 0 { 1.0 - dx_interp } else { dx_interp };
+                                            let weight_y =
+                                                if j == 0 { 1.0 - dy_interp } else { dy_interp };
+                                            let weight_a =
+                                                if k == 0 { 1.0 - da_interp } else { da_interp };
+                                            let contribution =
+                                                weighted_mag * weight_x * weight_y * weight_a;
+                                            let hist_index = (iy * DESC_WINDOW_WIDTH as i32 + ix)
+                                                * DESC_HIST_BINS as i32
+                                                + ia;
+                                            hist[hist_index as usize] += contribution;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Self::normalize_and_clip_descriptor(&mut hist);
+                hist
+            })
+            .collect()
+    }
+
     /// CPU-путь SIFT: обнаружение и вычисление дескрипторов.
     pub fn detect_and_compute_cpu(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
         // 1. Convert to grayscale
@@ -949,18 +1254,13 @@ impl Sift {
         match backend {
             SiftBackend::Cpu => Ok(self.detect_and_compute_cpu(img)),
             SiftBackend::WebGpu => sift_detect_and_compute_gpu(img, self),
-            SiftBackend::WebGpuWithCpuFallback => {
-                match sift_detect_and_compute_gpu(img, self) {
-                    Ok(result) => Ok(result),
-                    Err(err) => {
-                        warn!(
-                            "WebGPU backend failed ({}). Falling back to CPU SIFT.",
-                            err
-                        );
-                        Ok(self.detect_and_compute_cpu(img))
-                    }
+            SiftBackend::WebGpuWithCpuFallback => match sift_detect_and_compute_gpu(img, self) {
+                Ok(result) => Ok(result),
+                Err(err) => {
+                    warn!("WebGPU backend failed ({}). Falling back to CPU SIFT.", err);
+                    Ok(self.detect_and_compute_cpu(img))
                 }
-            }
+            },
         }
     }
 

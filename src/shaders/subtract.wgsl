@@ -13,7 +13,7 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var texture_a: texture_2d<f32>; // Первое изображение
 @group(0) @binding(2) var texture_b: texture_2d<f32>; // Второе изображение
-@group(0) @binding(3) var texture_out: texture_storage_2d<rgba32float, write>; // Выход (DoG)
+@group(0) @binding(3) var texture_out: texture_storage_2d<r32float, write>; // Выход (DoG)
 @group(0) @binding(4) var samp: sampler; // Заглушка для соответствия лэйауту
 
 @compute @workgroup_size(8, 8, 1)
