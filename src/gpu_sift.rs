@@ -20,11 +20,13 @@ struct ComputeParams {
     _padding2: u32,
 }
 
+// GPU путь пока не задействован в основном pipeline, поэтому подавляем предупреждения о неиспользуемом коде.
+#[allow(dead_code)]
 struct GpuSiftContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     param_buffer: wgpu::Buffer, // Буфер для ComputeParams
-    sampler: wgpu::Sampler,     // Сэмплер для чтения текстур
+    sampler: wgpu::Sampler,
     texture_bind_group_layout: wgpu::BindGroupLayout, // Лэйаут для (in_tex, out_tex, sampler, params)
     blur_pipeline_h: wgpu::ComputePipeline,           // Горизонтальный блюр
     blur_pipeline_v: wgpu::ComputePipeline,           // Вертикальный блюр
@@ -32,6 +34,7 @@ struct GpuSiftContext {
     downsample_pipeline: wgpu::ComputePipeline,       // Пайплайн для downsample (если нужно)
 }
 
+#[allow(dead_code)]
 impl GpuSiftContext {
     async fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::default(); // Используем дефолтные бэкенды
@@ -74,18 +77,9 @@ impl GpuSiftContext {
         });
 
         // 2. Сэмплер (например, билинейный с зажимом по краям)
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("SIFT Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest, // Мипмапы не используем здесь
-            ..Default::default()
-        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
 
-        // 3. Лэйаут для биндингов (одинаковый для всех наших пайплайнов)
+        // 3. Лэйаут для биндингов (одинаковый для всех наших пайплайнов) для float текстур
         // binding 0: params (uniform buffer)
         // binding 1: input texture 1 (texture_2d)
         // binding 2: input texture 2 / sampler (зависит от шейдера)
@@ -112,7 +106,7 @@ impl GpuSiftContext {
                         binding: 1,
                         visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true }, // Используем фильтруемый float
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -122,13 +116,8 @@ impl GpuSiftContext {
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::COMPUTE,
-                        // Гибкий вариант: либо текстура, либо сэмплер
-                        // Проще сделать два разных лэйаута, но для начала попробуем один
-                        // Вариант A: Сэмплер
-                        // ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        // Вариант B: Вторая текстура (для вычитания)
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -148,7 +137,7 @@ impl GpuSiftContext {
                         ty: wgpu::BindingType::StorageTexture {
                             access: wgpu::StorageTextureAccess::WriteOnly,
                             // Формат должен совпадать с форматом создаваемых текстур
-                            format: wgpu::TextureFormat::Rgba8Unorm, // Используем RGBA8 для простоты
+                            format: wgpu::TextureFormat::Rgba32Float,
                             view_dimension: wgpu::TextureViewDimension::D2,
                         },
                         count: None,
@@ -156,7 +145,7 @@ impl GpuSiftContext {
                 ],
             });
 
-        let texture_format = wgpu::TextureFormat::Rgba8Unorm; // Наш целевой формат
+        let texture_format = wgpu::TextureFormat::Rgba32Float; // Храним float значения
         let features = adapter.get_texture_format_features(texture_format);
         if !features
             .flags
@@ -245,19 +234,16 @@ impl GpuSiftContext {
         texture: &wgpu::Texture,
         width: u32,
         height: u32,
-    ) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>, String> {
+    ) -> Result<ImageBuffer<Rgba<f32>, Vec<f32>>, String> {
         let texture_format = texture.format();
         let bytes_per_pixel = match texture_format {
-            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => 4,
-            _ => {
-                return Err(format!(
-                    "Unsupported texture format for readback: {:?}",
-                    texture_format
-                ))
-            }
+            wgpu::TextureFormat::Rgba32Float => 16,
+            _ => return Err(format!("Unsupported texture format for readback: {:?}", texture_format)),
         };
 
-        let buffer_size = (width * height * bytes_per_pixel) as wgpu::BufferAddress;
+        let padded_bytes_per_row =
+            ((width * bytes_per_pixel as u32 + 255) / 256) * 256; // wgpu требует кратности 256
+        let buffer_size = padded_bytes_per_row as wgpu::BufferAddress * height as wgpu::BufferAddress;
         let buffer_desc = wgpu::BufferDescriptor {
             label: Some("Texture Readback Buffer"),
             size: buffer_size,
@@ -280,7 +266,7 @@ impl GpuSiftContext {
                 layout: wgpu::TexelCopyBufferLayout {
                     // Updated from ImageDataLayout
                     offset: 0,
-                    bytes_per_row: Some(width * bytes_per_pixel),
+                    bytes_per_row: Some(padded_bytes_per_row),
                     rows_per_image: Some(height),
                 },
             },
@@ -314,7 +300,21 @@ impl GpuSiftContext {
                 drop(data);
                 readback_buffer.unmap();
 
-                match ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, result_buffer) {
+                // Учитываем паддинг при формировании выходного буфера
+                let mut pixels: Vec<f32> = Vec::with_capacity((width * height * 4) as usize);
+                for row in 0..height {
+                    let start = (row * padded_bytes_per_row) as usize;
+                    let end = start + (width * bytes_per_pixel as u32) as usize;
+                    let row_slice = &result_buffer[start..end];
+                    // Преобразуем u8 -> f32 (little endian)
+                    let mut chunk = row_slice
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect::<Vec<f32>>();
+                    pixels.append(&mut chunk);
+                }
+
+                match ImageBuffer::<Rgba<f32>, Vec<f32>>::from_raw(width, height, pixels) {
                     Some(image) => Ok(image),
                     None => Err("Failed to create ImageBuffer from raw data.".to_string()),
                 }
@@ -324,32 +324,31 @@ impl GpuSiftContext {
         }
     }
     // ... (convert_rgba8_to_f32_gray, convert_rgba8_to_luma8) ...
-    fn convert_rgba8_to_f32_gray(
-        img_rgba: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    fn convert_rgba_f32_to_luma_f32(
+        img_rgba: &ImageBuffer<Rgba<f32>, Vec<f32>>,
     ) -> ImageBuffer<Luma<f32>, Vec<f32>> {
-        /* ... без изменений ... */
         let (width, height) = img_rgba.dimensions();
         let mut img_f32 = ImageBuffer::new(width, height);
         for y in 0..height {
             for x in 0..width {
                 let pixel_rgba = img_rgba.get_pixel(x, y);
-                let gray_u8 = pixel_rgba[0];
-                img_f32.put_pixel(x, y, Luma([gray_u8 as f32 / 255.0]));
+                let gray = pixel_rgba[0];
+                img_f32.put_pixel(x, y, Luma([gray]));
             }
         }
         img_f32
     }
-    fn convert_rgba8_to_luma8(img_rgba: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> GrayImage {
-        /* ... без изменений ... */
-        let (width, height) = img_rgba.dimensions();
-        let mut img_luma = GrayImage::new(width, height);
+
+    fn convert_luma_f32_to_u8(img_f32: &ImageBuffer<Luma<f32>, Vec<f32>>) -> GrayImage {
+        let (width, height) = img_f32.dimensions();
+        let mut img_u8 = GrayImage::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                let pixel_rgba = img_rgba.get_pixel(x, y);
-                img_luma.put_pixel(x, y, Luma([pixel_rgba[0]]));
+                let val = img_f32.get_pixel(x, y)[0].clamp(0.0, 1.0);
+                img_u8.put_pixel(x, y, Luma([(val * 255.0).round() as u8]));
             }
         }
-        img_luma
+        img_u8
     }
 
     // --- Функция для запуска compute shader ---
@@ -409,8 +408,16 @@ impl GpuSiftContext {
             base_gray.clone()
         };
 
-        // Конвертируем в RGBA для загрузки на GPU
-        let base_rgba = DynamicImage::ImageLuma8(base_image_blurred_cpu).to_rgba8();
+        // Конвертируем в RGBA для загрузки на GPU (float)
+        let base_rgba_u8 = DynamicImage::ImageLuma8(base_image_blurred_cpu).to_rgba8();
+        let mut base_rgba_f32: Vec<f32> =
+            Vec::with_capacity((base_rgba_u8.width() * base_rgba_u8.height() * 4) as usize);
+        for (_x, _y, pixel) in base_rgba_u8.enumerate_pixels() {
+            base_rgba_f32.push(pixel[0] as f32 / 255.0);
+            base_rgba_f32.push(pixel[1] as f32 / 255.0);
+            base_rgba_f32.push(pixel[2] as f32 / 255.0);
+            base_rgba_f32.push(pixel[3] as f32 / 255.0);
+        }
 
         let k = 2.0_f32.powf(1.0 / num_intervals as f32);
         // Сигмы *относительно начала текущей октавы*
@@ -421,7 +428,7 @@ impl GpuSiftContext {
         }
 
         // Формат текстур
-        let texture_format = wgpu::TextureFormat::Rgba8Unorm; // Используем для простоты
+        let texture_format = wgpu::TextureFormat::Rgba32Float; // Храним float для точности/знака
         let texture_usage = wgpu::TextureUsages::TEXTURE_BINDING |
                               wgpu::TextureUsages::STORAGE_BINDING | // Для записи из шейдера
                               wgpu::TextureUsages::COPY_DST |       // Для write_texture и readback
@@ -444,12 +451,13 @@ impl GpuSiftContext {
         };
         let mut current_octave_base_texture = self.device.create_texture(&base_texture_desc);
 
+        let bytes_per_row = current_width * 16; // 4 компонента * 4 байта
         self.queue.write_texture(
             current_octave_base_texture.as_image_copy(),
-            &base_rgba, // Данные RGBA8
+            bytemuck::cast_slice(&base_rgba_f32), // Данные RGBA32F
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(current_width * 4), // 4 байта на RGBA пиксель
+                bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(current_height),
             },
             base_texture_desc.size,
@@ -587,6 +595,13 @@ impl GpuSiftContext {
                                     &prev_gauss_texture.create_view(&Default::default()),
                                 ),
                             },
+                            // Placeholder (same as input) to satisfy layout binding 2
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &prev_gauss_texture.create_view(&Default::default()),
+                                ),
+                            },
                             wgpu::BindGroupEntry {
                                 binding: 3,
                                 resource: wgpu::BindingResource::TextureView(
@@ -629,6 +644,12 @@ impl GpuSiftContext {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &temp_blur_texture.create_view(&Default::default()),
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
                                 resource: wgpu::BindingResource::TextureView(
                                     &temp_blur_texture.create_view(&Default::default()),
                                 ),
@@ -800,6 +821,12 @@ impl GpuSiftContext {
                                         &source_texture.create_view(&Default::default()),
                                     ),
                                 },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: wgpu::BindingResource::TextureView(
+                                        &source_texture.create_view(&Default::default()),
+                                    ),
+                                },
                                 // !! Исправлено: Пишем в next_octave_base_texture
                                 wgpu::BindGroupEntry {
                                     binding: 3,
@@ -840,16 +867,16 @@ impl GpuSiftContext {
 // --- Обновленная функция верхнего уровня ---
 pub fn sift_detect_and_compute_gpu(
     img: &DynamicImage,
+    params: &Sift,
 ) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
     let _ = env_logger::try_init();
 
     pollster::block_on(async {
         let gpu_context = GpuSiftContext::new().await?;
-        let sift_params = Sift::default();
 
         let gray_img = img.to_luma8();
-        let initial_blur_amount = if sift_params.sigma > sift_params.assumed_blur {
-            (sift_params.sigma.powi(2) - sift_params.assumed_blur.powi(2)).sqrt()
+        let initial_blur_amount = if params.sigma > params.assumed_blur {
+            (params.sigma.powi(2) - params.assumed_blur.powi(2)).sqrt()
         } else {
             0.0
         };
@@ -861,9 +888,15 @@ pub fn sift_detect_and_compute_gpu(
         let base_image_dyn = DynamicImage::ImageLuma8(base_image_cpu);
 
         // Заглушка для gpu_build_pyramids
-        let gpu_gauss_pyramid: Vec<Vec<wgpu::Texture>> = Vec::new();
-        let gpu_dog_pyramid: Vec<Vec<wgpu::Texture>> = Vec::new();
-        // let (gpu_gauss_pyramid, gpu_dog_pyramid) = gpu_context.build_pyramids_gpu(...).await?;
+        let (gpu_gauss_pyramid, gpu_dog_pyramid) = gpu_context
+            .build_pyramids_gpu(
+                &base_image_dyn,
+                params.num_octaves,
+                params.num_intervals,
+                params.sigma,
+                params.assumed_blur,
+            )
+            .await?;
 
         let mut cpu_gauss_pyramid: Vec<Vec<GrayImage>> = Vec::new();
         let mut cpu_dog_pyramid: Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> = Vec::new();
@@ -876,7 +909,8 @@ pub fn sift_detect_and_compute_gpu(
                 let rgba_image = gpu_context
                     .read_texture_to_imagebuffer(texture, w, h)
                     .await?;
-                cpu_octave.push(GpuSiftContext::convert_rgba8_to_luma8(&rgba_image));
+                let luma_f32 = GpuSiftContext::convert_rgba_f32_to_luma_f32(&rgba_image);
+                cpu_octave.push(GpuSiftContext::convert_luma_f32_to_u8(&luma_f32));
             }
             cpu_gauss_pyramid.push(cpu_octave);
         }
@@ -887,26 +921,18 @@ pub fn sift_detect_and_compute_gpu(
                 let rgba_image = gpu_context
                     .read_texture_to_imagebuffer(texture, w, h)
                     .await?;
-                cpu_octave.push(GpuSiftContext::convert_rgba8_to_f32_gray(&rgba_image));
+                cpu_octave.push(GpuSiftContext::convert_rgba_f32_to_luma_f32(&rgba_image));
             }
             cpu_dog_pyramid.push(cpu_octave);
         }
         // --- Конец чтения ---
 
-        // --- Используем CPU пирамиды для теста ---
-        println!("Warning: Using CPU pyramid generation as GPU path is not implemented.");
-        // Вызываем публичные методы (сделаем их pub(crate))
-        let cpu_gauss_pyramid_real =
-            sift_params.generate_gaussian_pyramid(&base_image_dyn.to_luma8());
-        let cpu_dog_pyramid_real = sift_params.generate_dog_pyramid(&cpu_gauss_pyramid_real);
-
-        // Вызываем публичные методы (сделаем их pub(crate))
-        let initial_keypoints = sift_params.find_scale_space_extrema(&cpu_dog_pyramid_real);
+        let initial_keypoints = params.find_scale_space_extrema(&cpu_dog_pyramid);
         let refined_keypoints =
-            sift_params.refine_and_filter_extrema(&initial_keypoints, &cpu_dog_pyramid_real);
+            params.refine_and_filter_extrema(&initial_keypoints, &cpu_dog_pyramid);
         let oriented_keypoints =
-            sift_params.assign_orientations(&refined_keypoints, &cpu_gauss_pyramid_real);
-        let descriptors = sift_params.compute(&cpu_gauss_pyramid_real, &oriented_keypoints);
+            params.assign_orientations(&refined_keypoints, &cpu_gauss_pyramid);
+        let descriptors = params.compute(&cpu_gauss_pyramid, &oriented_keypoints);
 
         Ok((oriented_keypoints, descriptors))
     })

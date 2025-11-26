@@ -4,10 +4,27 @@
 use image::Rgb;
 use sift::draw_keypoints_to_image; // Импортируем новую функцию
 use sift::sift::{load_image_dyn, Sift}; // Импортируем Rgb для указания цвета
+use sift::SiftBackend;
+use std::env;
+use std::io;
 use std::time::Instant;
+
+fn detect_backend() -> SiftBackend {
+    match env::var("SIFT_BACKEND") {
+        Ok(value) => value.parse().unwrap_or_else(|err| {
+            eprintln!(
+                "Unknown SIFT_BACKEND value '{}': {}. Falling back to default backend.",
+                value, err
+            );
+            SiftBackend::default()
+        }),
+        Err(_) => SiftBackend::default(),
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let image_path = "data/1.jpg";
+    let backend = detect_backend();
 
     if std::fs::create_dir_all("data").is_err() {
         eprintln!(
@@ -29,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         img_dyn.width(),
         img_dyn.height()
     );
+    println!("Selected SIFT backend: {:?}", backend);
 
     // Используем параметры SIFT по умолчанию
     let sift = Sift::default();
@@ -36,7 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Detecting SIFT keypoints and computing descriptors...");
     // Используем новый метод, возвращающий и точки, и дескрипторы
     let start_time = Instant::now();
-    let (keypoints, descriptors) = sift.detect_and_compute(&img_dyn);
+    let (keypoints, descriptors) = sift
+        .detect_and_compute_with_backend(&img_dyn, backend)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let duration = start_time.elapsed();
 
     println!("SIFT processing took: {:?}", duration); // <--- Вывод времени

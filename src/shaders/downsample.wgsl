@@ -1,13 +1,21 @@
 // src/shaders/downsample.wgsl
 
-// Параметры могут быть не нужны, если размер берем из текстуры
-// struct Params { width: u32, height: u32, ... };
-// @group(0) @binding(0) var<uniform> params: Params;
+struct Params {
+    width: u32,
+    height: u32,
+    sigma: f32,
+    step_x: u32,
+    step_y: u32,
+    _padding1: u32,
+    _padding2: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
 
 @group(0) @binding(1) var texture_in: texture_2d<f32>;
-// binding(2) пропущен
-@group(0) @binding(3) var texture_out: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(4) var samp: sampler; // Можно использовать sampler linear для простого варианта
+@group(0) @binding(2) var texture_aux: texture_2d<f32>; // Заглушка для соответствия лэйауту
+@group(0) @binding(3) var texture_out: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var samp: sampler; // Не используется
 
 @compute @workgroup_size(8, 8, 1) // Размер группы для выходной текстуры
 fn main_downsample(@builtin(global_invocation_id) id: vec3<u32>) {

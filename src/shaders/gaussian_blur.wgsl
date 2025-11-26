@@ -6,14 +6,16 @@ struct Params {
     sigma: f32,
     step_x: u32,
     step_y: u32,
-    // Добавить паддинг если ComputeParams имеет его
-};
+    _padding1: u32,
+    _padding2: u32,
+}; // Структура должна совпадать с host-стороной ComputeParams.
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var texture_in: texture_2d<f32>;
-// binding(2) пропускаем (там была вторая текстура/сэмплер в старом дизайне)
-@group(0) @binding(3) var texture_out: texture_storage_2d<rgba8unorm, write>; // Пишем в RGBA8
-@group(0) @binding(4) var samp: sampler; // Используем сэмплер для чтения
+// binding(2) оставляем как заглушку, чтобы совпасть с общим BindGroupLayout
+@group(0) @binding(2) var texture_aux: texture_2d<f32>;
+@group(0) @binding(3) var texture_out: texture_storage_2d<rgba32float, write>; // Float формат
+@group(0) @binding(4) var samp: sampler; // Не используется, но оставлен для совместимости
 
 const KERNEL_RADIUS: i32 = 7; // Определяем радиус ядра (можно вычислить из sigma)
 const KERNEL_SIZE: u32 = 2u * u32(KERNEL_RADIUS) + 1u;
@@ -37,13 +39,18 @@ fn main_blur(@builtin(global_invocation_id) id: vec3<u32>) {
         // Координаты для чтения из входной текстуры
         let read_coord = out_coord + vec2<i32>(i * i32(params.step_x), i * i32(params.step_y));
 
-        // Чтение с использованием сэмплера (ClampToEdge позаботится о границах)
-        // textureSampleLevel требует координат в диапазоне [0.0, 1.0]
-        let uv = (vec2<f32>(read_coord) + vec2<f32>(0.5, 0.5)) / vec2<f32>(params.width, params.height);
-        let texel = textureSampleLevel(texture_in, samp, uv, 0.0); // 0.0 - уровень мипмапа
+        // Чтение без сэмплера, используя clamp в координатах
+        let clamped = clamp(
+            read_coord,
+            vec2<i32>(0, 0),
+            vec2<i32>(i32(params.width) - 1, i32(params.height) - 1),
+        );
+        let texel = textureLoad(texture_in, clamped, 0);
 
-        // TODO: Получить вес Гаусса для смещения `i`
-        let weight: f32 = 1.0; // Заглушка - использовать реальные веса!
+        // Гауссов вес
+        let offset = f32(i);
+        let sigma2 = params.sigma * params.sigma;
+        let weight: f32 = exp(-0.5 * (offset * offset) / sigma2);
 
         accumulated_color = accumulated_color + texel * weight;
         total_weight = total_weight + weight;

@@ -4,7 +4,9 @@ use imageproc::filter::gaussian_blur_f32;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 
-use crate::keypoints::KeyPoint;
+use crate::gpu_sift::sift_detect_and_compute_gpu;
+use crate::{keypoints::KeyPoint, SiftBackend};
+use log::warn;
 
 // Параметры SIFT по умолчанию, основанные на статье Лоу и распространенных реализациях
 const DEFAULT_SIGMA: f32 = 1.6;
@@ -894,9 +896,8 @@ impl Sift {
             .collect() // Собираем результаты от всех потоков в один Vec<Vec<f32>>
     }
 
-    /// Полный процесс SIFT: обнаружение и вычисление дескрипторов.
-    /// Возвращает ключевые точки и их дескрипторы.
-    pub fn detect_and_compute(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
+    /// CPU-путь SIFT: обнаружение и вычисление дескрипторов.
+    pub fn detect_and_compute_cpu(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
         // 1. Convert to grayscale
         let gray_img = img.to_luma8();
 
@@ -936,6 +937,36 @@ impl Sift {
         println!("Computed {} descriptors.", descriptors.len()); // Debug
 
         (oriented_keypoints, descriptors)
+    }
+
+    /// Полный процесс SIFT с выбором бэкенда. Для обратной совместимости `detect_and_compute`
+    /// использует CPU, а эта функция дает возможность попробовать WebGPU с откатом.
+    pub fn detect_and_compute_with_backend(
+        &self,
+        img: &DynamicImage,
+        backend: SiftBackend,
+    ) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
+        match backend {
+            SiftBackend::Cpu => Ok(self.detect_and_compute_cpu(img)),
+            SiftBackend::WebGpu => sift_detect_and_compute_gpu(img, self),
+            SiftBackend::WebGpuWithCpuFallback => {
+                match sift_detect_and_compute_gpu(img, self) {
+                    Ok(result) => Ok(result),
+                    Err(err) => {
+                        warn!(
+                            "WebGPU backend failed ({}). Falling back to CPU SIFT.",
+                            err
+                        );
+                        Ok(self.detect_and_compute_cpu(img))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Обратная совместимость: по умолчанию используем CPU путь.
+    pub fn detect_and_compute(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
+        self.detect_and_compute_cpu(img)
     }
 }
 
