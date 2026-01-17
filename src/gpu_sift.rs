@@ -2,6 +2,7 @@
 // WebGPU-based SIFT implementation
 
 use crate::keypoints::KeyPoint;
+use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use wgpu;
 
@@ -671,7 +672,10 @@ impl GpuSiftContext {
     /// Build Gaussian scale space on CPU and upload to GPU
     /// This is a hybrid approach: CPU builds pyramid, GPU does extrema detection
     fn build_pyramid_cpu(&self, image: &[u8], width: u32, height: u32) -> Vec<f32> {
-        let k = 2.0_f32.powf(1.0 / (self.config.scales as f32 - 3.0));
+        // k is the scale multiplier between adjacent scales
+        // Standard SIFT uses scales-3 intervals, but handle edge cases
+        let intervals = (self.config.scales as f32 - 3.0).max(1.0);
+        let k = 2.0_f32.powf(1.0 / intervals);
 
         let mut pyramid_data = Vec::new();
         let mut current_img: Vec<f32> = image.iter().map(|&p| p as f32 / 255.0).collect();
@@ -722,8 +726,13 @@ impl GpuSiftContext {
     }
 
     fn gaussian_blur_cpu(&self, img: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+        // Handle edge case of very small sigma
+        if sigma < 0.1 {
+            return img.to_vec();
+        }
+
         let radius = (sigma * 3.0).ceil() as i32;
-        let size = (2 * radius + 1) as usize;
+        let size = (2 * radius + 1).max(1) as usize;
 
         // Build kernel
         let mut kernel = vec![0.0f32; size];
@@ -737,83 +746,103 @@ impl GpuSiftContext {
             *k /= sum;
         }
 
-        // Horizontal pass
+        // Horizontal pass - parallel over rows
         let mut temp = vec![0.0f32; width * height];
-        for y in 0..height {
+        temp.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
             for x in 0..width {
                 let mut val = 0.0f32;
                 for i in 0..size {
                     let sx = (x as i32 + i as i32 - radius).clamp(0, width as i32 - 1) as usize;
                     val += img[y * width + sx] * kernel[i];
                 }
-                temp[y * width + x] = val;
+                row[x] = val;
             }
-        }
+        });
 
-        // Vertical pass
+        // Vertical pass - parallel over columns
         let mut result = vec![0.0f32; width * height];
-        for y in 0..height {
-            for x in 0..width {
-                let mut val = 0.0f32;
-                for i in 0..size {
-                    let sy = (y as i32 + i as i32 - radius).clamp(0, height as i32 - 1) as usize;
-                    val += temp[sy * width + x] * kernel[i];
+        result
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..width {
+                    let mut val = 0.0f32;
+                    for i in 0..size {
+                        let sy =
+                            (y as i32 + i as i32 - radius).clamp(0, height as i32 - 1) as usize;
+                        val += temp[sy * width + x] * kernel[i];
+                    }
+                    row[x] = val;
                 }
-                result[y * width + x] = val;
-            }
-        }
+            });
 
         result
     }
 
-    /// Compute DoG from Gaussian pyramid
+    /// Compute DoG from Gaussian pyramid (parallelized)
     fn compute_dog_cpu(&self, gaussian_pyramid: &[f32], width: u32, height: u32) -> Vec<f32> {
-        let mut dog_data = Vec::new();
-        let mut w = width as usize;
-        let mut h = height as usize;
         let scales = self.config.scales as usize;
         let dog_scales = scales - 1;
 
+        // First pass: collect octave info
+        let mut octave_info = Vec::new();
+        let mut w = width as usize;
+        let mut h = height as usize;
         let mut offset = 0usize;
 
-        for _octave in 0..self.config.octaves {
+        for _ in 0..self.config.octaves {
             if w < 8 || h < 8 {
                 break;
             }
-
             let level_size = w * h;
-
-            // Compute DoG for each adjacent pair of scales
-            for d in 0..dog_scales {
-                let scale1_start = offset + d * level_size;
-                let scale2_start = offset + (d + 1) * level_size;
-
-                for i in 0..level_size {
-                    let dog_val =
-                        gaussian_pyramid[scale2_start + i] - gaussian_pyramid[scale1_start + i];
-                    dog_data.push(dog_val);
-                }
-            }
-
+            octave_info.push((offset, level_size, w, h));
             offset += scales * level_size;
             w /= 2;
             h /= 2;
         }
 
+        // Compute total DoG size
+        let total_dog_size: usize = octave_info
+            .iter()
+            .map(|(_, level_size, _, _)| level_size * dog_scales)
+            .sum();
+
+        let mut dog_data = vec![0.0f32; total_dog_size];
+
+        // Parallel computation of DoG for each octave
+        let mut dog_offset = 0usize;
+        for (gauss_offset, level_size, _, _) in &octave_info {
+            for d in 0..dog_scales {
+                let scale1_start = gauss_offset + d * level_size;
+                let scale2_start = gauss_offset + (d + 1) * level_size;
+                let dog_start = dog_offset + d * level_size;
+
+                dog_data[dog_start..dog_start + level_size]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(i, dog_val)| {
+                        *dog_val =
+                            gaussian_pyramid[scale2_start + i] - gaussian_pyramid[scale1_start + i];
+                    });
+            }
+            dog_offset += dog_scales * level_size;
+        }
+
         dog_data
     }
 
-    /// Upload DoG pyramid to GPU in f16 format
+    /// Upload DoG pyramid to GPU in f16 format (parallelized conversion)
     fn upload_dog_pyramid(&self, dog_data: &[f32], ctx: &GpuRunContext) {
-        // Convert f32 to f16 packed as u32
-        let mut packed_data = Vec::new();
-        for chunk in dog_data.chunks(2) {
-            let v0 = chunk[0];
-            let v1 = if chunk.len() > 1 { chunk[1] } else { 0.0 };
-            let packed = half::f16::from_f32(v0).to_bits() as u32
-                | ((half::f16::from_f32(v1).to_bits() as u32) << 16);
-            packed_data.push(packed);
-        }
+        // Convert f32 to f16 packed as u32 (parallel)
+        let packed_data: Vec<u32> = dog_data
+            .par_chunks(2)
+            .map(|chunk| {
+                let v0 = chunk[0];
+                let v1 = if chunk.len() > 1 { chunk[1] } else { 0.0 };
+                half::f16::from_f32(v0).to_bits() as u32
+                    | ((half::f16::from_f32(v1).to_bits() as u32) << 16)
+            })
+            .collect();
 
         let bytes: Vec<u8> = packed_data.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.queue.write_buffer(&ctx.heap, 0, &bytes);

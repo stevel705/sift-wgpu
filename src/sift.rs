@@ -100,7 +100,7 @@ impl Sift {
         f32_img
     }
 
-    // Вспомогательная функция: вычитание двух изображений Luma<f32>
+    // Вспомогательная функция: вычитание двух изображений Luma<f32> (параллельно)
     fn subtract_f32_images(
         img1: &ImageBuffer<Luma<f32>, Vec<f32>>,
         img2: &ImageBuffer<Luma<f32>, Vec<f32>>,
@@ -111,15 +111,16 @@ impl Sift {
             img2.dimensions(),
             "Images must have the same dimensions for subtraction"
         );
-        let mut result_image = ImageBuffer::new(width, height);
-        for x in 0..width {
-            for y in 0..height {
-                let p1 = img1.get_pixel(x, y)[0];
-                let p2 = img2.get_pixel(x, y)[0];
-                result_image.put_pixel(x, y, Luma([p1 - p2])); // Прямое вычитание
-            }
-        }
-        result_image
+        let pixels1 = img1.as_raw();
+        let pixels2 = img2.as_raw();
+
+        let result_pixels: Vec<f32> = pixels1
+            .par_iter()
+            .zip(pixels2.par_iter())
+            .map(|(&p1, &p2)| p1 - p2)
+            .collect();
+
+        ImageBuffer::from_raw(width, height, result_pixels).expect("Failed to create result image")
     }
 
     // Построение гауссовой пирамиды
@@ -175,29 +176,31 @@ impl Sift {
         pyramid
     }
 
-    // Построение пирамиды разностей гауссианов (DoG)
+    // Построение пирамиды разностей гауссианов (DoG) - параллельно по октавам
     // gaussian_pyramid: результат generate_gaussian_pyramid
     // Возвращает: вектор октав, где каждая октава - это вектор DoG изображений (Luma<f32>)
     pub(crate) fn generate_dog_pyramid(
         &self,
         gaussian_pyramid: &[Vec<GrayImage>],
     ) -> Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> {
-        let mut dog_pyramid = Vec::with_capacity(gaussian_pyramid.len());
-        for octave_u8_images in gaussian_pyramid {
-            let mut dog_octave = Vec::with_capacity(octave_u8_images.len() - 1);
-            let octave_f32_images: Vec<_> = octave_u8_images
-                .iter()
-                .map(Sift::convert_u8_to_f32_gray)
-                .collect();
+        gaussian_pyramid
+            .par_iter()
+            .map(|octave_u8_images| {
+                // Convert to f32 in parallel
+                let octave_f32_images: Vec<_> = octave_u8_images
+                    .par_iter()
+                    .map(Sift::convert_u8_to_f32_gray)
+                    .collect();
 
-            for i in 0..(octave_f32_images.len() - 1) {
-                let dog_image =
-                    Sift::subtract_f32_images(&octave_f32_images[i + 1], &octave_f32_images[i]);
-                dog_octave.push(dog_image);
-            }
-            dog_pyramid.push(dog_octave);
-        }
-        dog_pyramid
+                // Compute DoG for adjacent pairs
+                (0..(octave_f32_images.len() - 1))
+                    .into_par_iter()
+                    .map(|i| {
+                        Sift::subtract_f32_images(&octave_f32_images[i + 1], &octave_f32_images[i])
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     // Вспомогательная функция для получения значения пикселя (безопасная для границ)
@@ -499,7 +502,7 @@ impl Sift {
         Some([det_x / det_a, det_y / det_a, det_z / det_a])
     }
 
-    // Поиск экстремумов в масштабно-пространственной области
+    // Поиск экстремумов в масштабно-пространственной области (параллельно по октавам)
     // dog_pyramid: результат generate_dog_pyramid
     // Возвращает: вектор кандидатов в ключевые точки
     /// Находит начальные кандидаты в ключевые точки (экстремумы DoG).
@@ -508,93 +511,95 @@ impl Sift {
         &self,
         dog_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
     ) -> Vec<KeyPoint> {
-        // ... (код поиска остается почти таким же, но создаем KeyPoint сразу) ...
-        let mut initial_keypoints = Vec::new();
-        let num_octaves = dog_pyramid.len();
+        let num_intervals = self.num_intervals as usize;
+        let border = self.image_border_width as i32;
 
-        for o_idx in 0..num_octaves {
-            let dog_octave = &dog_pyramid[o_idx];
-            if dog_octave.is_empty() {
-                continue;
-            }
-            let (width, height) = dog_octave[0].dimensions();
-
-            // Итерация по слоям (масштабам), где ищем экстремумы: с 1 по num_intervals
-            for s_idx in 1..=(self.num_intervals as usize) {
-                // Убедимся, что есть предыдущий и следующий слои для сравнения
-                if s_idx == 0 || s_idx >= dog_octave.len() - 1 {
-                    continue;
+        // Process octaves in parallel
+        dog_pyramid
+            .par_iter()
+            .enumerate()
+            .flat_map(|(o_idx, dog_octave)| {
+                if dog_octave.is_empty() {
+                    return Vec::new();
                 }
-
-                let img_prev = &dog_octave[s_idx - 1];
-                let img_curr = &dog_octave[s_idx];
-                let img_next = &dog_octave[s_idx + 1];
-
-                // Итерация по пикселям, избегая границ изображения
-                let border = self.image_border_width as i32;
-                // Преобразуем u32 в i32 для безопасного вычитания border
+                let (width, height) = dog_octave[0].dimensions();
                 let width_i32 = width as i32;
                 let height_i32 = height as i32;
+                let scale_factor = 2.0_f32.powi(o_idx as i32);
 
-                for y in border..(height_i32 - border) {
-                    for x in border..(width_i32 - border) {
-                        let val = Self::get_pixel_value(img_curr, x, y);
+                // Process scales in parallel within each octave
+                (1..=num_intervals)
+                    .into_par_iter()
+                    .filter(|&s_idx| s_idx < dog_octave.len() - 1)
+                    .flat_map(|s_idx| {
+                        let img_prev = &dog_octave[s_idx - 1];
+                        let img_curr = &dog_octave[s_idx];
+                        let img_next = &dog_octave[s_idx + 1];
 
-                        let mut is_max = true;
-                        let mut is_min = true;
+                        // Process rows in parallel
+                        (border..(height_i32 - border))
+                            .into_par_iter()
+                            .flat_map(|y| {
+                                let mut row_keypoints = Vec::new();
+                                for x in border..(width_i32 - border) {
+                                    let val = Self::get_pixel_value(img_curr, x, y);
 
-                        'check_neighbors: for dz_offset in -1..=1 {
-                            let current_s_offset_img = match dz_offset {
-                                -1 => img_prev,
-                                0 => img_curr,
-                                1 => img_next,
-                                _ => unreachable!(),
-                            };
-                            for dy_offset in -1..=1 {
-                                for dx_offset in -1..=1 {
-                                    if dz_offset == 0 && dy_offset == 0 && dx_offset == 0 {
-                                        continue;
+                                    let mut is_max = true;
+                                    let mut is_min = true;
+
+                                    'check_neighbors: for dz_offset in -1..=1 {
+                                        let current_s_offset_img = match dz_offset {
+                                            -1 => img_prev,
+                                            0 => img_curr,
+                                            1 => img_next,
+                                            _ => unreachable!(),
+                                        };
+                                        for dy_offset in -1..=1 {
+                                            for dx_offset in -1..=1 {
+                                                if dz_offset == 0
+                                                    && dy_offset == 0
+                                                    && dx_offset == 0
+                                                {
+                                                    continue;
+                                                }
+                                                let neighbor_val = Self::get_pixel_value(
+                                                    current_s_offset_img,
+                                                    x + dx_offset,
+                                                    y + dy_offset,
+                                                );
+
+                                                if val <= neighbor_val {
+                                                    is_max = false;
+                                                }
+                                                if val >= neighbor_val {
+                                                    is_min = false;
+                                                }
+                                                if !is_max && !is_min {
+                                                    break 'check_neighbors;
+                                                }
+                                            }
+                                        }
                                     }
-                                    let neighbor_val = Self::get_pixel_value(
-                                        current_s_offset_img,
-                                        x + dx_offset,
-                                        y + dy_offset,
-                                    );
 
-                                    if val <= neighbor_val {
-                                        is_max = false;
-                                    }
-                                    if val >= neighbor_val {
-                                        is_min = false;
-                                    }
-                                    if !is_max && !is_min {
-                                        break 'check_neighbors;
+                                    if is_max || is_min {
+                                        row_keypoints.push(KeyPoint {
+                                            x: (x as f32 + 0.5) * scale_factor,
+                                            y: (y as f32 + 0.5) * scale_factor,
+                                            size: 0.0,
+                                            angle: 0.0,
+                                            response: val,
+                                            octave: o_idx as i32,
+                                            layer: s_idx as i32,
+                                        });
                                     }
                                 }
-                            }
-                        }
-
-                        if is_max || is_min {
-                            // Найден начальный кандидат. Координаты в масштабе октавы.
-                            // Пересчитаем в масштаб исходного изображения при создании KeyPoint.
-                            let scale_factor = 2.0_f32.powi(o_idx as i32);
-                            let kp = KeyPoint {
-                                // x, y - координаты центра пикселя в масштабе ИСХОДНОГО изображения
-                                x: (x as f32 + 0.5) * scale_factor,
-                                y: (y as f32 + 0.5) * scale_factor,
-                                size: 0.0,     // Будет уточнено позже
-                                angle: 0.0,    // Будет вычислена позже
-                                response: val, // Значение DoG в этой точке
-                                octave: o_idx as i32,
-                                layer: s_idx as i32, // Слой в DoG пирамиде
-                            };
-                            initial_keypoints.push(kp);
-                        }
-                    }
-                }
-            }
-        }
-        initial_keypoints
+                                row_keypoints
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     pub(crate) fn assign_orientations(
