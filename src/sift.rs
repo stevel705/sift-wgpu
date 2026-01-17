@@ -4,7 +4,8 @@ use imageproc::filter::gaussian_blur_f32;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 
-use crate::keypoints::KeyPoint;
+use crate::{keypoints::KeyPoint, SiftBackend};
+use log::warn;
 
 // Параметры SIFT по умолчанию, основанные на статье Лоу и распространенных реализациях
 const DEFAULT_SIGMA: f32 = 1.6;
@@ -99,7 +100,7 @@ impl Sift {
         f32_img
     }
 
-    // Вспомогательная функция: вычитание двух изображений Luma<f32>
+    // Вспомогательная функция: вычитание двух изображений Luma<f32> (параллельно)
     fn subtract_f32_images(
         img1: &ImageBuffer<Luma<f32>, Vec<f32>>,
         img2: &ImageBuffer<Luma<f32>, Vec<f32>>,
@@ -110,21 +111,22 @@ impl Sift {
             img2.dimensions(),
             "Images must have the same dimensions for subtraction"
         );
-        let mut result_image = ImageBuffer::new(width, height);
-        for x in 0..width {
-            for y in 0..height {
-                let p1 = img1.get_pixel(x, y)[0];
-                let p2 = img2.get_pixel(x, y)[0];
-                result_image.put_pixel(x, y, Luma([p1 - p2])); // Прямое вычитание
-            }
-        }
-        result_image
+        let pixels1 = img1.as_raw();
+        let pixels2 = img2.as_raw();
+
+        let result_pixels: Vec<f32> = pixels1
+            .par_iter()
+            .zip(pixels2.par_iter())
+            .map(|(&p1, &p2)| p1 - p2)
+            .collect();
+
+        ImageBuffer::from_raw(width, height, result_pixels).expect("Failed to create result image")
     }
 
     // Построение гауссовой пирамиды
     // base_image: начальное изображение для пирамиды (после предварительной обработки)
     // Возвращает: вектор октав, где каждая октава - это вектор размытых изображений GrayImage
-    fn generate_gaussian_pyramid(&self, base_image: &GrayImage) -> Vec<Vec<GrayImage>> {
+    pub(crate) fn generate_gaussian_pyramid(&self, base_image: &GrayImage) -> Vec<Vec<GrayImage>> {
         let mut pyramid = Vec::with_capacity(self.num_octaves as usize);
         let mut current_octave_base_image = base_image.clone();
         let k = 2.0_f32.powf(1.0 / self.num_intervals as f32);
@@ -174,34 +176,36 @@ impl Sift {
         pyramid
     }
 
-    // Построение пирамиды разностей гауссианов (DoG)
+    // Построение пирамиды разностей гауссианов (DoG) - параллельно по октавам
     // gaussian_pyramid: результат generate_gaussian_pyramid
     // Возвращает: вектор октав, где каждая октава - это вектор DoG изображений (Luma<f32>)
-    fn generate_dog_pyramid(
+    pub(crate) fn generate_dog_pyramid(
         &self,
         gaussian_pyramid: &[Vec<GrayImage>],
     ) -> Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> {
-        let mut dog_pyramid = Vec::with_capacity(gaussian_pyramid.len());
-        for octave_u8_images in gaussian_pyramid {
-            let mut dog_octave = Vec::with_capacity(octave_u8_images.len() - 1);
-            let octave_f32_images: Vec<_> = octave_u8_images
-                .iter()
-                .map(Sift::convert_u8_to_f32_gray)
-                .collect();
+        gaussian_pyramid
+            .par_iter()
+            .map(|octave_u8_images| {
+                // Convert to f32 in parallel
+                let octave_f32_images: Vec<_> = octave_u8_images
+                    .par_iter()
+                    .map(Sift::convert_u8_to_f32_gray)
+                    .collect();
 
-            for i in 0..(octave_f32_images.len() - 1) {
-                let dog_image =
-                    Sift::subtract_f32_images(&octave_f32_images[i + 1], &octave_f32_images[i]);
-                dog_octave.push(dog_image);
-            }
-            dog_pyramid.push(dog_octave);
-        }
-        dog_pyramid
+                // Compute DoG for adjacent pairs
+                (0..(octave_f32_images.len() - 1))
+                    .into_par_iter()
+                    .map(|i| {
+                        Sift::subtract_f32_images(&octave_f32_images[i + 1], &octave_f32_images[i])
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     // Вспомогательная функция для получения значения пикселя (безопасная для границ)
     #[inline(always)]
-    fn get_pixel_value(img: &ImageBuffer<Luma<f32>, Vec<f32>>, x: i32, y: i32) -> f32 {
+    pub(crate) fn get_pixel_value(img: &ImageBuffer<Luma<f32>, Vec<f32>>, x: i32, y: i32) -> f32 {
         // Простая обработка границ - повторение крайнего пикселя
         let (width, height) = img.dimensions();
         let x_clamp = x.clamp(0, width as i32 - 1) as u32;
@@ -211,7 +215,7 @@ impl Sift {
 
     // Helper for Gaussian images (GrayImage -> f32)
     #[inline(always)]
-    fn get_gauss_pixel_value(img: &GrayImage, x: i32, y: i32) -> f32 {
+    pub(crate) fn get_gauss_pixel_value(img: &GrayImage, x: i32, y: i32) -> f32 {
         let (width, height) = img.dimensions();
         let x_clamp = x.clamp(0, width as i32 - 1) as u32;
         let y_clamp = y.clamp(0, height as i32 - 1) as u32;
@@ -219,7 +223,19 @@ impl Sift {
     }
 
     #[inline(always)]
-    fn get_gauss_pixel_bilinear(img: &GrayImage, x: f32, y: f32) -> f32 {
+    pub(crate) fn get_gauss_pixel_value_f32(
+        img: &ImageBuffer<Luma<f32>, Vec<f32>>,
+        x: i32,
+        y: i32,
+    ) -> f32 {
+        let (width, height) = img.dimensions();
+        let x_clamp = x.clamp(0, width as i32 - 1) as u32;
+        let y_clamp = y.clamp(0, height as i32 - 1) as u32;
+        img.get_pixel(x_clamp, y_clamp)[0]
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_gauss_pixel_bilinear(img: &GrayImage, x: f32, y: f32) -> f32 {
         // Ensure coordinates are within valid range for interpolation
         // Allow slightly outside [0, width/height - 1] to handle border cases, clamp later.
         let x_floor = x.floor();
@@ -249,8 +265,38 @@ impl Sift {
         val
     }
 
+    #[inline(always)]
+    pub(crate) fn get_gauss_pixel_bilinear_f32(
+        img: &ImageBuffer<Luma<f32>, Vec<f32>>,
+        x: f32,
+        y: f32,
+    ) -> f32 {
+        let x_floor = x.floor();
+        let y_floor = y.floor();
+        let x_ceil = x_floor + 1.0;
+        let y_ceil = y_floor + 1.0;
+
+        let dx = x - x_floor;
+        let dy = y - y_floor;
+
+        let x0 = x_floor as i32;
+        let y0 = y_floor as i32;
+        let x1 = x_ceil as i32;
+        let y1 = y_ceil as i32;
+
+        let q11 = Self::get_gauss_pixel_value_f32(img, x0, y0);
+        let q21 = Self::get_gauss_pixel_value_f32(img, x1, y0);
+        let q12 = Self::get_gauss_pixel_value_f32(img, x0, y1);
+        let q22 = Self::get_gauss_pixel_value_f32(img, x1, y1);
+
+        q11 * (1.0 - dx) * (1.0 - dy)
+            + q21 * dx * (1.0 - dy)
+            + q12 * (1.0 - dx) * dy
+            + q22 * dx * dy
+    }
+
     /// Уточняет положение экстремумов, отфильтровывает точки с низким контрастом и точки на краях.
-    fn refine_and_filter_extrema(
+    pub(crate) fn refine_and_filter_extrema(
         &self,
         initial_keypoints: &[KeyPoint],
         dog_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
@@ -456,105 +502,107 @@ impl Sift {
         Some([det_x / det_a, det_y / det_a, det_z / det_a])
     }
 
-    // Поиск экстремумов в масштабно-пространственной области
+    // Поиск экстремумов в масштабно-пространственной области (параллельно по октавам)
     // dog_pyramid: результат generate_dog_pyramid
     // Возвращает: вектор кандидатов в ключевые точки
     /// Находит начальные кандидаты в ключевые точки (экстремумы DoG).
     /// Возвращает `KeyPoint` с целочисленными координатами и слоем.
-    fn find_scale_space_extrema(
+    pub(crate) fn find_scale_space_extrema(
         &self,
         dog_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
     ) -> Vec<KeyPoint> {
-        // ... (код поиска остается почти таким же, но создаем KeyPoint сразу) ...
-        let mut initial_keypoints = Vec::new();
-        let num_octaves = dog_pyramid.len();
+        let num_intervals = self.num_intervals as usize;
+        let border = self.image_border_width as i32;
 
-        for o_idx in 0..num_octaves {
-            let dog_octave = &dog_pyramid[o_idx];
-            if dog_octave.is_empty() {
-                continue;
-            }
-            let (width, height) = dog_octave[0].dimensions();
-
-            // Итерация по слоям (масштабам), где ищем экстремумы: с 1 по num_intervals
-            for s_idx in 1..=(self.num_intervals as usize) {
-                // Убедимся, что есть предыдущий и следующий слои для сравнения
-                if s_idx == 0 || s_idx >= dog_octave.len() - 1 {
-                    continue;
+        // Process octaves in parallel
+        dog_pyramid
+            .par_iter()
+            .enumerate()
+            .flat_map(|(o_idx, dog_octave)| {
+                if dog_octave.is_empty() {
+                    return Vec::new();
                 }
-
-                let img_prev = &dog_octave[s_idx - 1];
-                let img_curr = &dog_octave[s_idx];
-                let img_next = &dog_octave[s_idx + 1];
-
-                // Итерация по пикселям, избегая границ изображения
-                let border = self.image_border_width as i32;
-                // Преобразуем u32 в i32 для безопасного вычитания border
+                let (width, height) = dog_octave[0].dimensions();
                 let width_i32 = width as i32;
                 let height_i32 = height as i32;
+                let scale_factor = 2.0_f32.powi(o_idx as i32);
 
-                for y in border..(height_i32 - border) {
-                    for x in border..(width_i32 - border) {
-                        let val = Self::get_pixel_value(img_curr, x, y);
+                // Process scales in parallel within each octave
+                (1..=num_intervals)
+                    .into_par_iter()
+                    .filter(|&s_idx| s_idx < dog_octave.len() - 1)
+                    .flat_map(|s_idx| {
+                        let img_prev = &dog_octave[s_idx - 1];
+                        let img_curr = &dog_octave[s_idx];
+                        let img_next = &dog_octave[s_idx + 1];
 
-                        let mut is_max = true;
-                        let mut is_min = true;
+                        // Process rows in parallel
+                        (border..(height_i32 - border))
+                            .into_par_iter()
+                            .flat_map(|y| {
+                                let mut row_keypoints = Vec::new();
+                                for x in border..(width_i32 - border) {
+                                    let val = Self::get_pixel_value(img_curr, x, y);
 
-                        'check_neighbors: for dz_offset in -1..=1 {
-                            let current_s_offset_img = match dz_offset {
-                                -1 => img_prev,
-                                0 => img_curr,
-                                1 => img_next,
-                                _ => unreachable!(),
-                            };
-                            for dy_offset in -1..=1 {
-                                for dx_offset in -1..=1 {
-                                    if dz_offset == 0 && dy_offset == 0 && dx_offset == 0 {
-                                        continue;
+                                    let mut is_max = true;
+                                    let mut is_min = true;
+
+                                    'check_neighbors: for dz_offset in -1..=1 {
+                                        let current_s_offset_img = match dz_offset {
+                                            -1 => img_prev,
+                                            0 => img_curr,
+                                            1 => img_next,
+                                            _ => unreachable!(),
+                                        };
+                                        for dy_offset in -1..=1 {
+                                            for dx_offset in -1..=1 {
+                                                if dz_offset == 0
+                                                    && dy_offset == 0
+                                                    && dx_offset == 0
+                                                {
+                                                    continue;
+                                                }
+                                                let neighbor_val = Self::get_pixel_value(
+                                                    current_s_offset_img,
+                                                    x + dx_offset,
+                                                    y + dy_offset,
+                                                );
+
+                                                if val <= neighbor_val {
+                                                    is_max = false;
+                                                }
+                                                if val >= neighbor_val {
+                                                    is_min = false;
+                                                }
+                                                if !is_max && !is_min {
+                                                    break 'check_neighbors;
+                                                }
+                                            }
+                                        }
                                     }
-                                    let neighbor_val = Self::get_pixel_value(
-                                        current_s_offset_img,
-                                        x + dx_offset,
-                                        y + dy_offset,
-                                    );
 
-                                    if val <= neighbor_val {
-                                        is_max = false;
-                                    }
-                                    if val >= neighbor_val {
-                                        is_min = false;
-                                    }
-                                    if !is_max && !is_min {
-                                        break 'check_neighbors;
+                                    if is_max || is_min {
+                                        row_keypoints.push(KeyPoint {
+                                            x: (x as f32 + 0.5) * scale_factor,
+                                            y: (y as f32 + 0.5) * scale_factor,
+                                            size: 0.0,
+                                            angle: 0.0,
+                                            response: val,
+                                            octave: o_idx as i32,
+                                            layer: s_idx as i32,
+                                        });
                                     }
                                 }
-                            }
-                        }
-
-                        if is_max || is_min {
-                            // Найден начальный кандидат. Координаты в масштабе октавы.
-                            // Пересчитаем в масштаб исходного изображения при создании KeyPoint.
-                            let scale_factor = 2.0_f32.powi(o_idx as i32);
-                            let kp = KeyPoint {
-                                // x, y - координаты центра пикселя в масштабе ИСХОДНОГО изображения
-                                x: (x as f32 + 0.5) * scale_factor,
-                                y: (y as f32 + 0.5) * scale_factor,
-                                size: 0.0,     // Будет уточнено позже
-                                angle: 0.0,    // Будет вычислена позже
-                                response: val, // Значение DoG в этой точке
-                                octave: o_idx as i32,
-                                layer: s_idx as i32, // Слой в DoG пирамиде
-                            };
-                            initial_keypoints.push(kp);
-                        }
-                    }
-                }
-            }
-        }
-        initial_keypoints
+                                row_keypoints
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
-    fn assign_orientations(
+    pub(crate) fn assign_orientations(
         &self,
         keypoints: &[KeyPoint],
         gaussian_pyramid: &[Vec<GrayImage>],
@@ -677,6 +725,123 @@ impl Sift {
             .collect() // Собираем результаты от всех потоков в один Vec<KeyPoint>
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn assign_orientations_f32(
+        &self,
+        keypoints: &[KeyPoint],
+        gaussian_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
+    ) -> Vec<KeyPoint> {
+        keypoints
+            .par_iter()
+            .flat_map(|kp| {
+                let mut oriented_keypoints_for_this_kp = Vec::new();
+                let octave_idx = kp.octave as usize;
+                let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
+
+                if octave_idx >= gaussian_pyramid.len()
+                    || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
+                {
+                    return oriented_keypoints_for_this_kp;
+                }
+
+                let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
+                let (img_width, img_height) = gauss_image.dimensions();
+                let scale_factor = 2.0_f32.powi(kp.octave);
+                let x_octave = kp.x / scale_factor;
+                let y_octave = kp.y / scale_factor;
+                let sigma_octave = kp.size / scale_factor;
+
+                if sigma_octave <= 0.0 {
+                    return oriented_keypoints_for_this_kp;
+                }
+
+                let window_radius = (ORIENTATION_WINDOW_RADIUS_FACTOR
+                    * ORIENTATION_GAUSSIAN_EXPANSION_FACTOR
+                    * sigma_octave)
+                    .round() as i32;
+                let weight_sigma = ORIENTATION_GAUSSIAN_EXPANSION_FACTOR * sigma_octave;
+                let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                let mut hist = [0.0f32; ORIENTATION_HIST_BINS];
+
+                for dy in -window_radius..=window_radius {
+                    for dx in -window_radius..=window_radius {
+                        let x_img = (x_octave + dx as f32).round() as i32;
+                        let y_img = (y_octave + dy as f32).round() as i32;
+                        if x_img < 1
+                            || x_img >= (img_width - 1) as i32
+                            || y_img < 1
+                            || y_img >= (img_height - 1) as i32
+                        {
+                            continue;
+                        }
+                        let grad_x = Self::get_gauss_pixel_value_f32(gauss_image, x_img + 1, y_img)
+                            - Self::get_gauss_pixel_value_f32(gauss_image, x_img - 1, y_img);
+                        let grad_y = Self::get_gauss_pixel_value_f32(gauss_image, x_img, y_img + 1)
+                            - Self::get_gauss_pixel_value_f32(gauss_image, x_img, y_img - 1);
+                        let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                        let angle = grad_y.atan2(grad_x);
+                        let weight =
+                            (-(dx as f32 * dx as f32 + dy as f32 * dy as f32) / weight_denom).exp();
+                        let angle_normalized = if angle < 0.0 { angle + 2.0 * PI } else { angle };
+                        let bin_float =
+                            angle_normalized * (ORIENTATION_HIST_BINS as f32) / (2.0 * PI);
+                        let bin_idx = bin_float.floor() as usize % ORIENTATION_HIST_BINS;
+                        hist[bin_idx] += magnitude * weight;
+                    }
+                }
+
+                // Сглаживание гистограммы
+                let mut smoothed_hist = hist;
+                for _ in 0..ORIENTATION_SMOOTHING_ITERATIONS {
+                    let prev_hist = smoothed_hist;
+                    for i in 0..ORIENTATION_HIST_BINS {
+                        let prev_bin = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
+                        let next_bin = (i + 1) % ORIENTATION_HIST_BINS;
+                        smoothed_hist[i] =
+                            (prev_hist[prev_bin] + prev_hist[i] + prev_hist[next_bin]) / 3.0;
+                    }
+                }
+                hist = smoothed_hist;
+
+                let max_peak_val = hist.iter().fold(0.0_f32, |max, &val| max.max(val));
+                let peak_threshold = max_peak_val * ORIENTATION_PEAK_RATIO;
+
+                for i in 0..ORIENTATION_HIST_BINS {
+                    let current_val = hist[i];
+                    if current_val >= peak_threshold {
+                        let prev_bin_idx = (i + ORIENTATION_HIST_BINS - 1) % ORIENTATION_HIST_BINS;
+                        let next_bin_idx = (i + 1) % ORIENTATION_HIST_BINS;
+                        let prev_val = hist[prev_bin_idx];
+                        let next_val = hist[next_bin_idx];
+                        if current_val > prev_val && current_val > next_val {
+                            let interp_denom = prev_val - 2.0 * current_val + next_val;
+                            let interpolated_offset = if interp_denom.abs() > 1e-5 {
+                                0.5 * (prev_val - next_val) / interp_denom
+                            } else {
+                                0.0
+                            };
+                            let bin_center_angle =
+                                (i as f32 + 0.5) * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
+                            let interpolated_angle = bin_center_angle
+                                + interpolated_offset * (2.0 * PI / ORIENTATION_HIST_BINS as f32);
+                            let final_angle = interpolated_angle.rem_euclid(2.0 * PI);
+                            let final_angle = if final_angle > PI {
+                                final_angle - 2.0 * PI
+                            } else {
+                                final_angle
+                            };
+                            let mut new_kp = kp.clone();
+                            new_kp.angle = final_angle;
+                            oriented_keypoints_for_this_kp.push(new_kp);
+                        }
+                    }
+                }
+
+                oriented_keypoints_for_this_kp
+            })
+            .collect()
+    }
+
     /// Обнаруживает ключевые точки SIFT на изображении.
     pub fn detect(&self, img: &DynamicImage) -> Vec<KeyPoint> {
         // 1. Convert to grayscale
@@ -721,7 +886,7 @@ impl Sift {
     }
 
     /// Нормализует вектор и обрезает значения.
-    fn normalize_and_clip_descriptor(desc: &mut [f32]) {
+    pub(crate) fn normalize_and_clip_descriptor(desc: &mut [f32]) {
         let norm = desc.iter().map(|&x| x * x).sum::<f32>().sqrt();
         if norm < 1e-8 {
             // Избегаем деления на ноль
@@ -894,9 +1059,145 @@ impl Sift {
             .collect() // Собираем результаты от всех потоков в один Vec<Vec<f32>>
     }
 
-    /// Полный процесс SIFT: обнаружение и вычисление дескрипторов.
-    /// Возвращает ключевые точки и их дескрипторы.
-    pub fn detect_and_compute(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
+    /// Вычисляет дескрипторы SIFT, используя гауссову пирамиду в формате f32.
+    pub fn compute_f32(
+        &self,
+        gaussian_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
+        keypoints: &[KeyPoint],
+    ) -> Vec<Vec<f32>> {
+        let desc_len = DESC_WINDOW_WIDTH * DESC_WINDOW_WIDTH * DESC_HIST_BINS;
+
+        keypoints
+            .par_iter()
+            .map(|kp| {
+                let mut hist = vec![0.0f32; desc_len];
+                let octave_idx = kp.octave as usize;
+                let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
+
+                if octave_idx >= gaussian_pyramid.len()
+                    || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
+                {
+                    return hist;
+                }
+
+                let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
+                let (img_width, img_height) = gauss_image.dimensions();
+                let scale_factor = 2.0_f32.powi(kp.octave);
+                let x_octave = kp.x / scale_factor;
+                let y_octave = kp.y / scale_factor;
+                let sigma_octave = kp.size / scale_factor;
+
+                if sigma_octave <= 0.0 {
+                    return hist;
+                }
+
+                let angle = kp.angle;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let bin_width_pixels = DESC_PATCH_SCALE_FACTOR * sigma_octave;
+                let window_width_pixels = bin_width_pixels * (DESC_WINDOW_WIDTH as f32);
+                let weight_sigma = 0.5 * window_width_pixels;
+                let weight_denom = 2.0 * weight_sigma * weight_sigma;
+                let sample_radius = (window_width_pixels * 2.0f32.sqrt() * 0.5).ceil() as i32;
+
+                for dy_img in -sample_radius..=sample_radius {
+                    for dx_img in -sample_radius..=sample_radius {
+                        let px = dx_img as f32;
+                        let py = dy_img as f32;
+                        let rx = cos_a * px + sin_a * py;
+                        let ry = -sin_a * px + cos_a * py;
+                        let x_bin_cont =
+                            rx / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
+                        let y_bin_cont =
+                            ry / bin_width_pixels + (DESC_WINDOW_WIDTH as f32) / 2.0 - 0.5;
+
+                        if x_bin_cont > -1.0
+                            && x_bin_cont < (DESC_WINDOW_WIDTH as f32)
+                            && y_bin_cont > -1.0
+                            && y_bin_cont < (DESC_WINDOW_WIDTH as f32)
+                        {
+                            let x_sample = x_octave + px;
+                            let y_sample = y_octave + py;
+                            if x_sample < 0.0
+                                || x_sample >= (img_width - 1) as f32
+                                || y_sample < 0.0
+                                || y_sample >= (img_height - 1) as f32
+                            {
+                                continue;
+                            }
+
+                            let grad_x = Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample + 1.0,
+                                y_sample,
+                            ) - Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample - 1.0,
+                                y_sample,
+                            );
+                            let grad_y = Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample,
+                                y_sample + 1.0,
+                            ) - Self::get_gauss_pixel_bilinear_f32(
+                                gauss_image,
+                                x_sample,
+                                y_sample - 1.0,
+                            );
+                            let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
+                            let pixel_angle = grad_y.atan2(grad_x);
+                            let angle_relative = (pixel_angle - angle).rem_euclid(2.0 * PI);
+                            let weight = (-(px * px + py * py) / weight_denom).exp();
+                            let weighted_mag = magnitude * weight;
+                            let angle_bin_cont =
+                                angle_relative * (DESC_HIST_BINS as f32) / (2.0 * PI);
+                            let x_bin_idx = x_bin_cont.floor() as i32;
+                            let y_bin_idx = y_bin_cont.floor() as i32;
+                            let angle_bin_idx = angle_bin_cont.floor() as i32;
+                            let dx_interp = x_bin_cont - x_bin_idx as f32;
+                            let dy_interp = y_bin_cont - y_bin_idx as f32;
+                            let da_interp = angle_bin_cont - angle_bin_idx as f32;
+
+                            for i in 0..2 {
+                                for j in 0..2 {
+                                    for k in 0..2 {
+                                        let ix = x_bin_idx + i;
+                                        let iy = y_bin_idx + j;
+                                        let ia =
+                                            (angle_bin_idx + k).rem_euclid(DESC_HIST_BINS as i32);
+                                        if ix >= 0
+                                            && ix < DESC_WINDOW_WIDTH as i32
+                                            && iy >= 0
+                                            && iy < DESC_WINDOW_WIDTH as i32
+                                        {
+                                            let weight_x =
+                                                if i == 0 { 1.0 - dx_interp } else { dx_interp };
+                                            let weight_y =
+                                                if j == 0 { 1.0 - dy_interp } else { dy_interp };
+                                            let weight_a =
+                                                if k == 0 { 1.0 - da_interp } else { da_interp };
+                                            let contribution =
+                                                weighted_mag * weight_x * weight_y * weight_a;
+                                            let hist_index = (iy * DESC_WINDOW_WIDTH as i32 + ix)
+                                                * DESC_HIST_BINS as i32
+                                                + ia;
+                                            hist[hist_index as usize] += contribution;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Self::normalize_and_clip_descriptor(&mut hist);
+                hist
+            })
+            .collect()
+    }
+
+    /// CPU-путь SIFT: обнаружение и вычисление дескрипторов.
+    pub fn detect_and_compute_cpu(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
         // 1. Convert to grayscale
         let gray_img = img.to_luma8();
 
@@ -913,7 +1214,6 @@ impl Sift {
         };
 
         // 3. Build Gaussian pyramid
-        // Эту пирамиду будем использовать и для ориентации, и для дескрипторов
         let gaussian_pyramid = self.generate_gaussian_pyramid(&base_image);
 
         // 4. Build Difference-of-Gaussians (DoG) pyramid
@@ -938,9 +1238,79 @@ impl Sift {
 
         (oriented_keypoints, descriptors)
     }
+
+    /// Полный процесс SIFT с выбором бэкенда. Для обратной совместимости `detect_and_compute`
+    /// использует CPU, а эта функция дает возможность попробовать WebGPU с откатом.
+    pub fn detect_and_compute_with_backend(
+        &self,
+        img: &DynamicImage,
+        backend: SiftBackend,
+    ) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
+        match backend {
+            SiftBackend::Cpu => Ok(self.detect_and_compute_cpu(img)),
+            SiftBackend::WebGpu => {
+                // Use GPU implementation
+                use crate::gpu_sift::{GpuSiftConfig, GpuSiftContext};
+
+                let gray = img.to_luma8();
+                let (width, height) = gray.dimensions();
+                let pixels = gray.into_raw();
+
+                let config = GpuSiftConfig {
+                    octaves: self.num_octaves,
+                    scales: self.num_intervals + 3, // SIFT uses s+3 scales per octave
+                    base_sigma: self.sigma,
+                    contrast_threshold: self.contrast_threshold,
+                    edge_threshold: self.edge_threshold,
+                };
+
+                // Run GPU detection synchronously using tokio
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+                    rt.block_on(async {
+                        let ctx = GpuSiftContext::new(config)
+                            .await
+                            .map_err(|e| format!("GPU init failed: {}", e))?;
+
+                        ctx.detect(&pixels, width, height)
+                            .await
+                            .map_err(|e| format!("GPU detection failed: {}", e))
+                    })
+                })
+                .join()
+                .map_err(|_| "GPU thread panicked".to_string())??;
+
+                // Convert [u8; 128] descriptors to Vec<f32>
+                let (keypoints, descriptors_u8) = result;
+                let descriptors: Vec<Vec<f32>> = descriptors_u8
+                    .into_iter()
+                    .map(|d| d.iter().map(|&v| v as f32 / 255.0).collect())
+                    .collect();
+
+                Ok((keypoints, descriptors))
+            }
+            SiftBackend::WebGpuWithCpuFallback => {
+                // Try GPU, fallback to CPU
+                match self.detect_and_compute_with_backend(img, SiftBackend::WebGpu) {
+                    Ok(result) => Ok(result),
+                    Err(e) => {
+                        warn!("WebGPU failed ({}), falling back to CPU.", e);
+                        Ok(self.detect_and_compute_cpu(img))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Обратная совместимость: по умолчанию используем CPU путь.
+    pub fn detect_and_compute(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
+        self.detect_and_compute_cpu(img)
+    }
 }
 
-// Вспомогательные публичные функции (можно оставить в lib.rs или здесь и реэкспортировать)
+// Utility functions
 pub fn load_image_dyn(path: &str) -> Result<DynamicImage, image::ImageError> {
     image::open(path)
 }
@@ -949,8 +1319,8 @@ pub fn save_gray_image(image: &GrayImage, path: &str) -> Result<(), image::Image
     image.save(path)
 }
 
-// Вспомогательная функция для визуализации DoG изображений (Luma<f32>)
-// Нормализует значения к диапазону [0, 255] и сохраняет как GrayImage
+// Helper function for visualizing DoG images (Luma<f32>)
+// Normalizes values to the range [0, 255] and saves as a GrayImage
 pub fn convert_f32_to_grayimage_normalized(
     img_f32: &ImageBuffer<Luma<f32>, Vec<f32>>,
 ) -> GrayImage {
@@ -998,8 +1368,8 @@ pub fn convert_f32_to_grayimage_normalized(
 
 #[cfg(test)]
 mod tests {
-    use super::*; // Импортируем все из родительского модуля
-    use image::GrayImage; // Нужен для теста билинейной интерполяции
+    use super::*;
+    use image::GrayImage;
 
     #[test]
     fn test_solve_linear_system_solvable() {

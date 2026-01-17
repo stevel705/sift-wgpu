@@ -1,9 +1,44 @@
+pub mod gpu_sift;
 pub mod keypoints;
 pub mod sift;
 
+use std::str::FromStr;
+
 // Реэкспорт основных типов
+pub use gpu_sift::{GpuSiftConfig, GpuSiftContext};
 pub use keypoints::KeyPoint;
 pub use sift::{convert_f32_to_grayimage_normalized, load_image_dyn, save_gray_image, Sift};
+
+/// Выбор бэкенда для расчета SIFT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiftBackend {
+    /// Только CPU.
+    Cpu,
+    /// Только WebGPU (ошибки пробрасываются наверх).
+    WebGpu,
+    /// Сначала пробуем WebGPU, при ошибке тихо откатываемся на CPU.
+    WebGpuWithCpuFallback,
+}
+
+impl Default for SiftBackend {
+    fn default() -> Self {
+        SiftBackend::WebGpuWithCpuFallback
+    }
+}
+
+impl FromStr for SiftBackend {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_lowercase();
+        match normalized.as_str() {
+            "cpu" => Ok(SiftBackend::Cpu),
+            "webgpu" | "wgpu" | "gpu" => Ok(SiftBackend::WebGpu),
+            "auto" | "fallback" | "prefer-gpu" => Ok(SiftBackend::WebGpuWithCpuFallback),
+            _ => Err(format!("Unknown SIFT backend: {value}")),
+        }
+    }
+}
 
 // Оригинальные функции из твоего примера, если они все еще нужны снаружи
 use image::{open, DynamicImage, GrayImage, Rgb, RgbImage}; // Добавляем RgbImage, Rgb

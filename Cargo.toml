@@ -28,3 +28,14 @@ image = "0.25.6"
 ndarray = "0.16.1"
 imageproc = "0.25.0"
 rayon = "1.10.0"
+wgpu = "25.0.0" # Основной крейт wgpu
+pollster = "0.4.0" # Для блокирующего выполнения async wgpu кода (просто для начала)
+bytemuck = { version = "1.23.0", features = ["derive"] } # Для безопасного кастинга данных в байты
+log = "0.4.27" # wgpu использует логгирование
+env_logger = "0.11.8" # Простой логгер для примера
+futures-intrusive = "0.5" # Для использования futures в wgpu
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] } # Для GPU backend runtime
+half = "2.4" # Для f16 конвертации в GPU пайплайне
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] } # Additional features for tests
