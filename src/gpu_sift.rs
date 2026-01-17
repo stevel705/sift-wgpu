@@ -1,1276 +1,1524 @@
-// src/gpu_sift.rs
+// gpu_sift/mod.rs
+// WebGPU-based SIFT implementation
 
 use crate::keypoints::KeyPoint;
-use crate::sift::Sift; // Импортируем структуру Sift
+use std::sync::{Arc, Mutex};
+use wgpu;
 
-use image::{imageops::FilterType, DynamicImage, GrayImage, ImageBuffer, Luma};
-use std::env;
-use std::sync::{mpsc, Arc};
-use wgpu::Adapter; // Используем Arc для Device/Queue, если нужно будет передавать
-use wgpu::util::DeviceExt;
-
-// --- Структура для параметров шейдера ---
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ComputeParams {
-    width: u32,
-    height: u32,
-    sigma: f32,     // Sigma для Гаусса или другой параметр
-    step_x: u32,    // 1 для горизонтального, 0 для вертикального/другого
-    step_y: u32,    // 0 для горизонтального, 1 для вертикального/другого
-    _padding1: u32, // Паддинг для выравнивания std140/std430
-    _padding2: u32,
+// ===== Configuration =====
+pub struct GpuSiftConfig {
+    pub octaves: u32,
+    pub scales: u32,             // includes +2 extra scales (e.g., 5 total)
+    pub base_sigma: f32,         // initial blur (e.g., 1.6)
+    pub contrast_threshold: f32, // e.g., 0.03
+    pub edge_threshold: f32,     // e.g., 10.0
 }
 
-// GPU путь пока не задействован в основном pipeline, поэтому подавляем предупреждения о неиспользуемом коде.
-#[allow(dead_code)]
-struct GpuSiftContext {
+impl Default for GpuSiftConfig {
+    fn default() -> Self {
+        Self {
+            octaves: 4,
+            scales: 5, // 5 scales → 4 DoG layers
+            base_sigma: 1.6,
+            contrast_threshold: 0.03,
+            edge_threshold: 10.0,
+        }
+    }
+}
+
+// ===== GPU Resources =====
+pub struct GpuSiftContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    param_buffer: wgpu::Buffer, // Буфер для ComputeParams
-    sampler: wgpu::Sampler,
-    texture_bind_group_layout: wgpu::BindGroupLayout, // Лэйаут для (params, tex1, tex2, out_tex, sampler)
-    blur_pipeline_h: wgpu::ComputePipeline,           // Горизонтальный блюр
-    blur_pipeline_v: wgpu::ComputePipeline,           // Вертикальный блюр
-    subtract_pipeline: wgpu::ComputePipeline,         // Вычитание текстур
-    downsample_pipeline: wgpu::ComputePipeline,       // Пайплайн для downsample (если нужно)
+    pipelines: GpuPipelines,
+    #[allow(dead_code)]
+    kernels: GpuKernels,
+    buffers: Mutex<GpuSiftBuffers>,
+    #[allow(dead_code)]
+    config: GpuSiftConfig,
 }
 
 #[allow(dead_code)]
+struct GpuPipelines {
+    upload: wgpu::ComputePipeline,
+    blur_h: wgpu::ComputePipeline,
+    blur_v: wgpu::ComputePipeline,
+    downsample: wgpu::ComputePipeline,
+    dog: wgpu::ComputePipeline,
+    extrema: wgpu::ComputePipeline,
+    orientation: wgpu::ComputePipeline,
+    descriptor: wgpu::ComputePipeline,
+}
+
+#[allow(dead_code)]
+struct GpuKernels {
+    // Precomputed Gaussian kernels for each scale
+    kernels: Vec<Vec<f32>>, // kernels[scale_idx] = weights
+}
+
+struct GpuSiftBuffers {
+    // Pyramid heap
+    heap: wgpu::Buffer,
+    heap_capacity: u64,
+
+    // Metadata
+    meta_buffer: wgpu::Buffer,
+    level_offsets: wgpu::Buffer,
+    level_widths: wgpu::Buffer,
+    level_heights: wgpu::Buffer,
+
+    // Gaussian kernel weights (one buffer per scale)
+    #[allow(dead_code)]
+    kernel_buffers: Vec<wgpu::Buffer>,
+
+    // Keypoint buffers
+    extrema_counter: wgpu::Buffer,
+    keypoints_staging: wgpu::Buffer,
+    orientation_counter: wgpu::Buffer,
+    keypoints_final: wgpu::Buffer,
+    descriptors: wgpu::Buffer,
+
+    // Readback buffers
+    readback_counters: wgpu::Buffer,
+    readback_keypoints: wgpu::Buffer,
+    readback_descriptors: wgpu::Buffer,
+
+    // Current image dimensions
+    current_width: u32,
+    current_height: u32,
+}
+
+// Lightweight clone for async operations (no mutex held)
+struct GpuRunContext {
+    heap: wgpu::Buffer,
+    meta_buffer: wgpu::Buffer,
+    level_offsets: wgpu::Buffer,
+    level_widths: wgpu::Buffer,
+    level_heights: wgpu::Buffer,
+    #[allow(dead_code)]
+    kernel_buffers: Vec<wgpu::Buffer>,
+    extrema_counter: wgpu::Buffer,
+    keypoints_staging: wgpu::Buffer,
+    orientation_counter: wgpu::Buffer,
+    keypoints_final: wgpu::Buffer,
+    descriptors: wgpu::Buffer,
+}
+
+// ===== Public API =====
 impl GpuSiftContext {
-    async fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::default(); // Используем дефолтные бэкенды
+    pub async fn new(config: GpuSiftConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        // Request WebGPU device/queue
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await;
 
-        // Запрашиваем адаптер
-        let adapter: Adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-            })
-            .await // Option<Adapter>
-            .expect("Failed to find an appropriate adapter");
-
-        let required_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-
-        // Дескриптор устройства для wgpu
-        let descriptor = wgpu::DeviceDescriptor {
-            label: Some("SIFT GPU Device"),
-            required_features: required_features,
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off, // Дефолтные лимиты
+        let adapter = match adapter {
+            Ok(a) => a,
+            Err(_) => return Err("No suitable GPU adapter found".into()),
         };
 
-        // Запрашиваем устройство
         let (device, queue) = adapter
-            .request_device(&descriptor)
-            .await
-            .map_err(|e| format!("Failed to get device: {}", e))?;
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("SIFT GPU Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+                trace: Default::default(),
+            })
+            .await?;
 
-        // --- Создание ресурсов ---
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
 
-        // 1. Буфер для параметров
-        let param_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("SIFT Compute Params Buffer"),
-            size: std::mem::size_of::<ComputeParams>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Precompute Gaussian kernels
+        let kernels = Self::compute_kernels(&config);
 
-        // 2. Сэмплер (например, билинейный с зажимом по краям)
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        // Create compute pipelines
+        let pipelines = Self::create_pipelines(&device)?;
 
-        // 3. Лэйаут для биндингов (одинаковый для всех наших пайплайнов) для float текстур
-        // binding 0: params (uniform buffer)
-        // binding 1: input texture 1 (texture_2d)
-        // binding 2: input texture 2 / sampler (зависит от шейдера)
-        // binding 3: output texture (storage texture)
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("SIFT Texture Bind Group Layout"),
-                entries: &[
-                    // Params
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                std::mem::size_of::<ComputeParams>() as _,
-                            ),
-                        },
-                        count: None,
-                    },
-                    // Input Texture 1
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // Input Texture 2 (для вычитания) OR Sampler (для блюра/даунсэмплинга)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // Добавим сэмплер отдельно на binding 4
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4, // Используем другой индекс
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // Output Texture (Storage)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            // Формат должен совпадать с форматом создаваемых текстур
-                            format: wgpu::TextureFormat::R32Float,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+        // Initialize empty buffers
+        let mut buffers = GpuSiftBuffers::new(&device, 0, 0);
 
-        let texture_format = wgpu::TextureFormat::R32Float; // Храним float значения (один канал)
-        let features = adapter.get_texture_format_features(texture_format);
-        if !features
-            .flags
-            .contains(wgpu::TextureFormatFeatureFlags::STORAGE_READ_WRITE)
-        {
-            return Err(format!(
-                "GPU does not support writing to {:?} storage texture",
-                texture_format
-            ));
-        }
+        // Initialize kernel weight buffers
+        buffers.initialize_kernel_buffers(&device, &queue, &kernels);
 
-        // 4. Загрузка WGSL шейдеров и создание пайплайнов
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("SIFT Pipeline Layout"),
-            bind_group_layouts: &[&texture_bind_group_layout], // Используем наш лэйаут
-            push_constant_ranges: &[],                         // Push константы не используем
-        });
+        let buffers = Mutex::new(buffers);
 
-        // --- Шейдер для Гаусса (сепарабельный) ---
-        // Мы передаем sigma и направление (step_x, step_y) в uniform
-        // Радиус ядра определяется в шейдере на основе sigma
-        // TODO: Написать gaussian_blur.wgsl
-        let blur_shader_module =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/gaussian_blur.wgsl"));
-
-        let blur_pipeline_h = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Gaussian Blur Pipeline H"),
-            layout: Some(&pipeline_layout),
-            module: &blur_shader_module,
-            entry_point: Some("main_blur"), // Точка входа для блюра
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        // Вертикальный пайплайн использует тот же шейдер, но другие параметры step_x/step_y
-        let blur_pipeline_v = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Gaussian Blur Pipeline V"),
-            layout: Some(&pipeline_layout),
-            module: &blur_shader_module,
-            entry_point: Some("main_blur"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        // --- Шейдер для вычитания ---
-        // TODO: Написать subtract.wgsl
-        let subtract_shader_module =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/subtract.wgsl"));
-        let subtract_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Subtract Pipeline"),
-            layout: Some(&pipeline_layout), // Используем тот же лэйаут
-            module: &subtract_shader_module,
-            entry_point: Some("main_subtract"), // Точка входа для вычитания
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        // TODO: Создать downsample_pipeline аналогично
-        let downsample_shader_module =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/downsample.wgsl"));
-        let downsample_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Downsample Pipeline"),
-                layout: Some(&pipeline_layout), // Используем тот же лэйаут? (Да, если читает 1 текстуру и пишет в другую)
-                module: &downsample_shader_module,
-                entry_point: Some("main_downsample"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        // --- Возвращаем контекст ---
-        Ok(GpuSiftContext {
-            device: Arc::new(device),
-            queue: Arc::new(queue),
-            param_buffer,
-            sampler,
-            texture_bind_group_layout,
-            blur_pipeline_h,
-            blur_pipeline_v,
-            subtract_pipeline,
-            downsample_pipeline,
+        Ok(Self {
+            device,
+            queue,
+            pipelines,
+            kernels,
+            buffers,
+            config,
         })
     }
 
-    async fn read_texture_to_imagebuffer(
+    pub async fn detect(
         &self,
-        texture: &wgpu::Texture,
+        image: &[u8],
         width: u32,
         height: u32,
-    ) -> Result<ImageBuffer<Luma<f32>, Vec<f32>>, String> {
-        let texture_format = texture.format();
-        let bytes_per_pixel = match texture_format {
-            wgpu::TextureFormat::R32Float => 4,
-            _ => return Err(format!("Unsupported texture format for readback: {:?}", texture_format)),
+    ) -> Result<(Vec<KeyPoint>, Vec<[u8; 128]>), Box<dyn std::error::Error>> {
+        // 1. Ensure buffers are sized correctly
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            buffers.ensure_capacity(&self.device, width, height, &self.config);
+        }
+
+        // 2. Clone buffer handles (release lock before async)
+        let run_ctx = {
+            let buffers = self.buffers.lock().unwrap();
+            GpuRunContext {
+                heap: buffers.heap.clone(),
+                meta_buffer: buffers.meta_buffer.clone(),
+                level_offsets: buffers.level_offsets.clone(),
+                level_widths: buffers.level_widths.clone(),
+                level_heights: buffers.level_heights.clone(),
+                kernel_buffers: buffers.kernel_buffers.clone(),
+                extrema_counter: buffers.extrema_counter.clone(),
+                keypoints_staging: buffers.keypoints_staging.clone(),
+                orientation_counter: buffers.orientation_counter.clone(),
+                keypoints_final: buffers.keypoints_final.clone(),
+                descriptors: buffers.descriptors.clone(),
+            }
         };
 
-        let padded_bytes_per_row =
-            ((width * bytes_per_pixel as u32 + 255) / 256) * 256; // wgpu требует кратности 256
-        let buffer_size =
-            padded_bytes_per_row as wgpu::BufferAddress * height as wgpu::BufferAddress;
-        let buffer_desc = wgpu::BufferDescriptor {
-            label: Some("Texture Readback Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        };
-        let readback_buffer = self.device.create_buffer(&buffer_desc);
+        // 3. Build DoG pyramid on CPU (hybrid approach for now)
+        let gaussian_pyramid = self.build_pyramid_cpu(image, width, height);
+        let dog_pyramid = self.compute_dog_cpu(&gaussian_pyramid, width, height);
+
+        // 4. Upload DoG pyramid to GPU
+        self.upload_dog_pyramid(&dog_pyramid, &run_ctx);
+
+        // 5. Execute GPU pipeline (extrema detection, orientation, descriptors)
+        self.execute_pipeline(width, height, &run_ctx).await?;
+
+        // 6. Readback results
+        let (keypoints, descriptors) = self.readback_results(&run_ctx).await?;
+
+        Ok((keypoints, descriptors))
+    }
+
+    fn compute_kernels(config: &GpuSiftConfig) -> GpuKernels {
+        let mut kernels = Vec::new();
+        let k = 2.0_f32.powf(1.0 / (config.scales as f32 - 2.0));
+
+        for s in 0..config.scales {
+            let sigma = config.base_sigma * k.powi(s as i32);
+            let radius = (4.0 * sigma).ceil() as usize;
+            let size = 2 * radius + 1;
+
+            let mut weights = vec![0.0; size];
+            let two_sigma_sq = 2.0 * sigma * sigma;
+            let mut sum = 0.0;
+
+            for (i, weight) in weights.iter_mut().enumerate() {
+                let x = (i as f32) - (radius as f32);
+                *weight = (-x * x / two_sigma_sq).exp();
+                sum += *weight;
+            }
+
+            // Normalize
+            for weight in weights.iter_mut() {
+                *weight /= sum;
+            }
+
+            kernels.push(weights);
+        }
+
+        GpuKernels { kernels }
+    }
+
+    fn create_pipelines(device: &wgpu::Device) -> Result<GpuPipelines, Box<dyn std::error::Error>> {
+        // Load shaders
+        let upload_src = include_str!("shaders/upload.wgsl");
+        let blur_src = include_str!("shaders/gaussian_blur.wgsl");
+        let downsample_src = include_str!("shaders/downsample.wgsl");
+        let dog_src = include_str!("shaders/dog.wgsl");
+        let extrema_src = include_str!("shaders/extrema_detect.wgsl");
+        let orientation_src = include_str!("shaders/orientation.wgsl");
+        let descriptor_src = include_str!("shaders/descriptor.wgsl");
+
+        let upload_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Upload Shader"),
+            source: wgpu::ShaderSource::Wgsl(upload_src.into()),
+        });
+
+        let blur_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(blur_src.into()),
+        });
+
+        let downsample_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Downsample Shader"),
+            source: wgpu::ShaderSource::Wgsl(downsample_src.into()),
+        });
+
+        let dog_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DoG Shader"),
+            source: wgpu::ShaderSource::Wgsl(dog_src.into()),
+        });
+
+        let extrema_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Extrema Shader"),
+            source: wgpu::ShaderSource::Wgsl(extrema_src.into()),
+        });
+
+        let orientation_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Orientation Shader"),
+            source: wgpu::ShaderSource::Wgsl(orientation_src.into()),
+        });
+
+        let descriptor_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Descriptor Shader"),
+            source: wgpu::ShaderSource::Wgsl(descriptor_src.into()),
+        });
+
+        // Create bind group layouts
+        // Upload pipeline: @group(0) params (uniform), input_u8, heap
+        let upload_bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Upload BGL 0"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Blur/downsample: @group(0) heap_in/out, @group(1) params + weights
+        let blur_bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blur BGL 0"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let blur_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blur BGL 1"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // DoG: @group(0) header, params, level_offsets, level_widths, level_heights, heap_in
+        //      @group(1) heap_out
+        let dog_bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DoG BGL 0"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let dog_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DoG BGL 1"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        // Extrema: @group(0) meta, @group(1) heap, @group(2) output
+        let extrema_bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Extrema BGL 0"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let extrema_bgl1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Extrema BGL 1"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let extrema_bgl2 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Extrema BGL 2"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Create compute pipelines
+        let upload_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Upload Layout"),
+            bind_group_layouts: &[&upload_bgl0],
+            push_constant_ranges: &[],
+        });
+
+        let blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blur Layout"),
+            bind_group_layouts: &[&blur_bgl0, &blur_bgl1],
+            push_constant_ranges: &[],
+        });
+
+        let dog_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("DoG Layout"),
+            bind_group_layouts: &[&dog_bgl0, &dog_bgl1],
+            push_constant_ranges: &[],
+        });
+
+        let extrema_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Extrema Layout"),
+            bind_group_layouts: &[&extrema_bgl0, &extrema_bgl1, &extrema_bgl2],
+            push_constant_ranges: &[],
+        });
+
+        let upload = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Upload Pipeline"),
+            layout: Some(&upload_layout),
+            module: &upload_module,
+            entry_point: Some("upload_grayscale"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let blur_h = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Blur H Pipeline"),
+            layout: Some(&blur_layout),
+            module: &blur_module,
+            entry_point: Some("gaussian_blur"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let blur_v = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Blur V Pipeline"),
+            layout: Some(&blur_layout),
+            module: &blur_module,
+            entry_point: Some("gaussian_blur"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let downsample = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Downsample Pipeline"),
+            layout: Some(&blur_layout),
+            module: &downsample_module,
+            entry_point: Some("downsample"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let dog = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("DoG Pipeline"),
+            layout: Some(&dog_layout),
+            module: &dog_module,
+            entry_point: Some("compute_dog"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let extrema = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Extrema Pipeline"),
+            layout: Some(&extrema_layout),
+            module: &extrema_module,
+            entry_point: Some("detect_extrema"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Orientation and descriptor pipelines (simplified, need proper layouts)
+        let orientation = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Orientation Pipeline"),
+            layout: None, // auto-layout for now
+            module: &orientation_module,
+            entry_point: Some("compute_orientation"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let descriptor = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Descriptor Pipeline"),
+            layout: None, // auto-layout for now
+            module: &descriptor_module,
+            entry_point: Some("compute_descriptor"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Ok(GpuPipelines {
+            upload,
+            blur_h,
+            blur_v,
+            downsample,
+            dog,
+            extrema,
+            orientation,
+            descriptor,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn upload_image(
+        &self,
+        image: &[u8],
+        width: u32,
+        height: u32,
+        ctx: &GpuRunContext,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Write image data to a temporary staging area at the END of heap
+        // The upload shader will convert u8->f16 and write to the beginning
+        let image_size = (width * height) as usize;
+        let staging_offset = ctx.heap.size() as usize - ((image_size + 3) / 4) * 4; // Aligned
+
+        // Create a padded buffer for u8 data (4-byte aligned)
+        let mut padded_image = vec![0u8; ((image_size + 3) / 4) * 4];
+        padded_image[..image_size].copy_from_slice(image);
+
+        self.queue
+            .write_buffer(&ctx.heap, staging_offset as u64, &padded_image);
+        Ok(())
+    }
+
+    /// Build Gaussian scale space on CPU and upload to GPU
+    /// This is a hybrid approach: CPU builds pyramid, GPU does extrema detection
+    fn build_pyramid_cpu(&self, image: &[u8], width: u32, height: u32) -> Vec<f32> {
+        let k = 2.0_f32.powf(1.0 / (self.config.scales as f32 - 3.0));
+
+        let mut pyramid_data = Vec::new();
+        let mut current_img: Vec<f32> = image.iter().map(|&p| p as f32 / 255.0).collect();
+        let mut w = width as usize;
+        let mut h = height as usize;
+
+        for _octave in 0..self.config.octaves {
+            if w < 8 || h < 8 {
+                break;
+            }
+
+            // Build scales for this octave
+            for s in 0..self.config.scales {
+                let sigma = self.config.base_sigma * k.powi(s as i32);
+
+                // Apply Gaussian blur
+                let blurred = if s == 0 && _octave == 0 {
+                    current_img.clone() // First scale of first octave - use as is
+                } else if s == 0 {
+                    current_img.clone() // First scale of other octaves - already downsampled
+                } else {
+                    self.gaussian_blur_cpu(&current_img, w, h, sigma)
+                };
+
+                pyramid_data.extend_from_slice(&blurred);
+
+                if s == self.config.scales - 3 {
+                    // This is the scale we'll downsample from
+                    current_img = blurred;
+                }
+            }
+
+            // Downsample for next octave
+            let new_w = w / 2;
+            let new_h = h / 2;
+            let mut downsampled = vec![0.0f32; new_w * new_h];
+            for y in 0..new_h {
+                for x in 0..new_w {
+                    downsampled[y * new_w + x] = current_img[(y * 2) * w + (x * 2)];
+                }
+            }
+            current_img = downsampled;
+            w = new_w;
+            h = new_h;
+        }
+
+        pyramid_data
+    }
+
+    fn gaussian_blur_cpu(&self, img: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+        let radius = (sigma * 3.0).ceil() as i32;
+        let size = (2 * radius + 1) as usize;
+
+        // Build kernel
+        let mut kernel = vec![0.0f32; size];
+        let mut sum = 0.0f32;
+        for i in 0..size {
+            let x = (i as i32 - radius) as f32;
+            kernel[i] = (-x * x / (2.0 * sigma * sigma)).exp();
+            sum += kernel[i];
+        }
+        for k in kernel.iter_mut() {
+            *k /= sum;
+        }
+
+        // Horizontal pass
+        let mut temp = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let mut val = 0.0f32;
+                for i in 0..size {
+                    let sx = (x as i32 + i as i32 - radius).clamp(0, width as i32 - 1) as usize;
+                    val += img[y * width + sx] * kernel[i];
+                }
+                temp[y * width + x] = val;
+            }
+        }
+
+        // Vertical pass
+        let mut result = vec![0.0f32; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let mut val = 0.0f32;
+                for i in 0..size {
+                    let sy = (y as i32 + i as i32 - radius).clamp(0, height as i32 - 1) as usize;
+                    val += temp[sy * width + x] * kernel[i];
+                }
+                result[y * width + x] = val;
+            }
+        }
+
+        result
+    }
+
+    /// Compute DoG from Gaussian pyramid
+    fn compute_dog_cpu(&self, gaussian_pyramid: &[f32], width: u32, height: u32) -> Vec<f32> {
+        let mut dog_data = Vec::new();
+        let mut w = width as usize;
+        let mut h = height as usize;
+        let scales = self.config.scales as usize;
+        let dog_scales = scales - 1;
+
+        let mut offset = 0usize;
+
+        for _octave in 0..self.config.octaves {
+            if w < 8 || h < 8 {
+                break;
+            }
+
+            let level_size = w * h;
+
+            // Compute DoG for each adjacent pair of scales
+            for d in 0..dog_scales {
+                let scale1_start = offset + d * level_size;
+                let scale2_start = offset + (d + 1) * level_size;
+
+                for i in 0..level_size {
+                    let dog_val =
+                        gaussian_pyramid[scale2_start + i] - gaussian_pyramid[scale1_start + i];
+                    dog_data.push(dog_val);
+                }
+            }
+
+            offset += scales * level_size;
+            w /= 2;
+            h /= 2;
+        }
+
+        dog_data
+    }
+
+    /// Upload DoG pyramid to GPU in f16 format
+    fn upload_dog_pyramid(&self, dog_data: &[f32], ctx: &GpuRunContext) {
+        // Convert f32 to f16 packed as u32
+        let mut packed_data = Vec::new();
+        for chunk in dog_data.chunks(2) {
+            let v0 = chunk[0];
+            let v1 = if chunk.len() > 1 { chunk[1] } else { 0.0 };
+            let packed = half::f16::from_f32(v0).to_bits() as u32
+                | ((half::f16::from_f32(v1).to_bits() as u32) << 16);
+            packed_data.push(packed);
+        }
+
+        let bytes: Vec<u8> = packed_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.queue.write_buffer(&ctx.heap, 0, &bytes);
+    }
+
+    async fn execute_pipeline(
+        &self,
+        width: u32,
+        height: u32,
+        ctx: &GpuRunContext,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // DoG pyramid has (scales-1) layers per octave
+        let dog_scales = self.config.scales - 1;
+
+        // Compute metadata: level offsets, widths, heights for DoG pyramid
+        let mut level_offsets_data = Vec::new();
+        let mut level_widths_data = Vec::new();
+        let mut level_heights_data = Vec::new();
+
+        let mut offset = 0u32;
+        let mut w = width;
+        let mut h = height;
+        let mut actual_octaves = 0u32;
+
+        for octave in 0..self.config.octaves {
+            if w < 8 || h < 8 {
+                break;
+            }
+            actual_octaves = octave + 1;
+
+            // DoG has (scales-1) layers per octave
+            for _scale in 0..dog_scales {
+                level_offsets_data.push(offset);
+                level_widths_data.push(w);
+                level_heights_data.push(h);
+
+                let pixels = w * h;
+                offset += (pixels + 1) / 2; // f16 packed as u32
+            }
+
+            w /= 2;
+            h /= 2;
+        }
+
+        // Write metadata to GPU
+        let offsets_bytes: Vec<u8> = level_offsets_data
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let widths_bytes: Vec<u8> = level_widths_data
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let heights_bytes: Vec<u8> = level_heights_data
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        self.queue
+            .write_buffer(&ctx.level_offsets, 0, &offsets_bytes);
+        self.queue.write_buffer(&ctx.level_widths, 0, &widths_bytes);
+        self.queue
+            .write_buffer(&ctx.level_heights, 0, &heights_bytes);
+
+        // Write pyramid metadata
+        // Note: extrema shader expects dog_scales (scales-1), not scales
+        let meta_data = [
+            actual_octaves,
+            dog_scales,     // Number of DoG scales per octave
+            dog_scales - 2, // Usable DoG layers for extrema (need 3 adjacent)
+            width,
+            height,
+            self.config.base_sigma.to_bits(),
+            self.config.contrast_threshold.to_bits(),
+            self.config.edge_threshold.to_bits(),
+        ];
+        let meta_bytes: Vec<u8> = meta_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.queue.write_buffer(&ctx.meta_buffer, 0, &meta_bytes);
+
+        // Clear counters
+        self.queue.write_buffer(&ctx.extrema_counter, 0, &[0u8; 4]);
+        self.queue
+            .write_buffer(&ctx.orientation_counter, 0, &[0u8; 4]);
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Texture Readback Encoder"),
+                label: Some("SIFT Encoder"),
             });
 
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                // Updated from ImageCopyBuffer
-                buffer: &readback_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    // Updated from ImageDataLayout
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
+        // DoG pyramid is already in heap (built on CPU and uploaded)
+
+        // ===== STAGE 1: Extrema Detection =====
+        // Create bind groups for extrema detection
+        let extrema_bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Extrema BG0"),
+            layout: &self.pipelines.extrema.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.meta_buffer.as_entire_binding(),
                 },
-            },
-            texture.size(),
-        );
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        // --- Ожидание и чтение буфера с mpsc ---
-        let buffer_slice = readback_buffer.slice(..);
-        let (sender, receiver) = mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
-
-        // Запускаем маппинг с колбэком
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            // Добавляем колбэк
-            let _ = sender.send(result);
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.level_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ctx.level_widths.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ctx.level_heights.as_entire_binding(),
+                },
+            ],
         });
 
-        // Запускаем обработку GPU и ждем
-        if let Err(e) = self.device.poll(wgpu::MaintainBase::Wait) {
-            return Err(format!("Device poll failed: {:?}", e));
+        let extrema_bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Extrema BG1"),
+            layout: &self.pipelines.extrema.get_bind_group_layout(1),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ctx.heap.as_entire_binding(),
+            }],
+        });
+
+        let extrema_bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Extrema BG2"),
+            layout: &self.pipelines.extrema.get_bind_group_layout(2),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.extrema_counter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.keypoints_staging.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Dispatch extrema detection
+        // The shader uses workgroup_id.z to determine (octave, dog_layer)
+        // For extrema detection we need 3 adjacent DoG layers, so we can detect
+        // extrema in (dog_scales - 2) middle layers
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Extrema Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.pipelines.extrema);
+            compute_pass.set_bind_group(0, &extrema_bg0, &[]);
+            compute_pass.set_bind_group(1, &extrema_bg1, &[]);
+            compute_pass.set_bind_group(2, &extrema_bg2, &[]);
+
+            // Calculate total z workgroups: octaves * (dog_scales - 2)
+            // -2 because we need 3 adjacent layers for extrema detection
+            let usable_dog_scales = dog_scales.saturating_sub(2).max(1);
+            let total_z = actual_octaves * usable_dog_scales;
+
+            let workgroups_x = (width + 15) / 16;
+            let workgroups_y = (height + 15) / 16;
+
+            compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, total_z);
         }
 
-        // Ожидаем результат из канала
-        match receiver.recv() {
-            // Убираем .await
-            Ok(Ok(())) => {
-                // Успешный маппинг
-                let data = buffer_slice.get_mapped_range();
-                let result_buffer = data.to_vec();
-                drop(data);
-                readback_buffer.unmap();
+        self.queue.submit(Some(encoder.finish()));
 
-                // Учитываем паддинг при формировании выходного буфера
-                let mut pixels: Vec<f32> = Vec::with_capacity((width * height) as usize);
-                for row in 0..height {
-                    let start = (row * padded_bytes_per_row) as usize;
-                    let end = start + (width * bytes_per_pixel as u32) as usize;
-                    let row_slice = &result_buffer[start..end];
-                    // Преобразуем u8 -> f32 (little endian)
-                    for b in row_slice.chunks_exact(4) {
-                        pixels.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
-                    }
-                }
+        // Submit and wait for extrema detection to complete
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+        let mut encoder2 = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Orientation Encoder"),
+            });
 
-                match ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(width, height, pixels) {
-                    Some(image) => Ok(image),
-                    None => Err("Failed to create ImageBuffer from raw data.".to_string()),
-                }
-            }
-            Ok(Err(e)) => Err(format!("Failed to map buffer: {:?}", e)), // Ошибка маппинга
-            Err(e) => Err(format!("Channel receive error: {:?}", e)),    // Ошибка канала
+        // Create orientation bind groups
+        let orient_bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Orientation BG0"),
+            layout: &self.pipelines.orientation.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.level_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ctx.level_widths.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ctx.level_heights.as_entire_binding(),
+                },
+            ],
+        });
+
+        let orient_bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Orientation BG1"),
+            layout: &self.pipelines.orientation.get_bind_group_layout(1),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ctx.heap.as_entire_binding(),
+            }],
+        });
+
+        let orient_bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Orientation BG2"),
+            layout: &self.pipelines.orientation.get_bind_group_layout(2),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.keypoints_staging.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.extrema_counter.as_entire_binding(),
+                },
+            ],
+        });
+
+        let orient_bg3 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Orientation BG3"),
+            layout: &self.pipelines.orientation.get_bind_group_layout(3),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.orientation_counter.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.keypoints_final.as_entire_binding(),
+                },
+            ],
+        });
+
+        {
+            let mut compute_pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Orientation Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.pipelines.orientation);
+            compute_pass.set_bind_group(0, &orient_bg0, &[]);
+            compute_pass.set_bind_group(1, &orient_bg1, &[]);
+            compute_pass.set_bind_group(2, &orient_bg2, &[]);
+            compute_pass.set_bind_group(3, &orient_bg3, &[]);
+
+            // Dispatch orientation computation
+            // Each keypoint needs 36 threads (one per histogram bin)
+            // For simplicity, dispatch fixed workgroups (will be bounded by shader)
+            let max_keypoints = 1024; // Conservative estimate
+            let workgroups = (max_keypoints * 36 + 35) / 36;
+            compute_pass.dispatch_workgroups(workgroups, 1, 1);
         }
+
+        self.queue.submit(Some(encoder2.finish()));
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+
+        // Stage 3: Descriptor computation
+        let mut encoder3 = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Descriptor Encoder"),
+            });
+
+        // Create descriptor bind groups
+        let desc_bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Descriptor BG0"),
+            layout: &self.pipelines.descriptor.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.level_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ctx.level_widths.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: ctx.level_heights.as_entire_binding(),
+                },
+            ],
+        });
+
+        let desc_bg1 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Descriptor BG1"),
+            layout: &self.pipelines.descriptor.get_bind_group_layout(1),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ctx.heap.as_entire_binding(),
+            }],
+        });
+
+        let desc_bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Descriptor BG2"),
+            layout: &self.pipelines.descriptor.get_bind_group_layout(2),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ctx.keypoints_final.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ctx.orientation_counter.as_entire_binding(),
+                },
+            ],
+        });
+
+        let desc_bg3 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Descriptor BG3"),
+            layout: &self.pipelines.descriptor.get_bind_group_layout(3),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ctx.descriptors.as_entire_binding(),
+            }],
+        });
+
+        {
+            let mut compute_pass = encoder3.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Descriptor Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.pipelines.descriptor);
+            compute_pass.set_bind_group(0, &desc_bg0, &[]);
+            compute_pass.set_bind_group(1, &desc_bg1, &[]);
+            compute_pass.set_bind_group(2, &desc_bg2, &[]);
+            compute_pass.set_bind_group(3, &desc_bg3, &[]);
+
+            // Each descriptor needs 4 threads
+            let max_final_keypoints = 2048;
+            let workgroups = (max_final_keypoints * 4 + 3) / 4;
+            compute_pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        self.queue.submit(Some(encoder3.finish()));
+
+        // Wait for all GPU work to complete
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+
+        Ok(())
     }
-    // ... (convert_rgba8_to_f32_gray, convert_rgba8_to_luma8) ...
-    fn convert_luma_f32_to_u8(img_f32: &ImageBuffer<Luma<f32>, Vec<f32>>) -> GrayImage {
-        let (width, height) = img_f32.dimensions();
-        let mut img_u8 = GrayImage::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let val = img_f32.get_pixel(x, y)[0].clamp(0.0, 1.0);
-                img_u8.put_pixel(x, y, Luma([(val * 255.0).round() as u8]));
-            }
-        }
-        img_u8
-    }
 
-    fn image_abs_diff_stats_f32(
-        a: &ImageBuffer<Luma<f32>, Vec<f32>>,
-        b: &ImageBuffer<Luma<f32>, Vec<f32>>,
-    ) -> (f32, f32) {
-        let mut sum = 0.0f32;
-        let mut maxv = 0.0f32;
-        let (w, h) = a.dimensions();
-        for y in 0..h {
-            for x in 0..w {
-                let da = a.get_pixel(x, y)[0];
-                let db = b.get_pixel(x, y)[0];
-                let d = (da - db).abs();
-                sum += d;
-                if d > maxv {
-                    maxv = d;
-                }
-            }
-        }
-        let mean = sum / (w * h) as f32;
-        (mean, maxv)
-    }
-
-    // --- Функция для запуска compute shader ---
-    fn run_compute(
+    async fn readback_results(
         &self,
-        pipeline: &wgpu::ComputePipeline,
-        bind_group: &wgpu::BindGroup,
-        width: u32,
-        height: u32,
-        label: &str,
-    ) {
-        // Рассчитываем количество рабочих групп
-        // TODO: Получить workgroup_size из пайплайна или задать константой
-        let workgroup_size_x = 8;
-        let workgroup_size_y = 8;
-        let workgroups_x = (width + workgroup_size_x - 1) / workgroup_size_x;
-        let workgroups_y = (height + workgroup_size_y - 1) / workgroup_size_y;
-
+        ctx: &GpuRunContext,
+    ) -> Result<(Vec<KeyPoint>, Vec<[u8; 128]>), Box<dyn std::error::Error>> {
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
-        {
-            // Начало compute pass
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(label),
-                timestamp_writes: None, // Таймстемпы пока не используем
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Readback Encoder"),
             });
-            compute_pass.set_pipeline(pipeline);
-            compute_pass.set_bind_group(0, bind_group, &[]); // group index 0
-            compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1); // Запускаем
-        } // Конец compute pass (дропаем compute_pass)
 
-        self.queue.submit(std::iter::once(encoder.finish()));
-    }
+        let buffers = self.buffers.lock().unwrap();
 
-    async fn build_pyramids_gpu(
-        &self,
-        base_image_dyn: &DynamicImage, // Принимаем DynamicImage
-        num_octaves: u32,
-        num_intervals: u32,
-        initial_sigma: f32, // sigma базового изображения для 0-й октавы
-        assumed_blur: f32,  // Пре-блюр исходного изображения
-    ) -> Result<(Vec<Vec<wgpu::Texture>>, Vec<Vec<wgpu::Texture>>), String> {
-        // 1. Подготовка базового изображения и параметров CPU
-        let base_gray = base_image_dyn.to_luma8(); // Для получения размеров
-        let (mut current_width, mut current_height) = base_gray.dimensions();
-
-        // Применяем начальный блюр на CPU (пока что, идеально - делать на GPU)
-        let initial_blur_amount = if initial_sigma > assumed_blur {
-            (initial_sigma.powi(2) - assumed_blur.powi(2)).sqrt()
-        } else {
-            0.0
-        };
-        let base_image_blurred_cpu = if initial_blur_amount > 1e-4 {
-            imageproc::filter::gaussian_blur_f32(&base_gray, initial_blur_amount)
-        } else {
-            base_gray.clone()
-        };
-
-        // Конвертируем в RGBA для загрузки на GPU (float)
-        let base_luma_u8 = DynamicImage::ImageLuma8(base_image_blurred_cpu);
-        let base_luma = base_luma_u8.to_luma8();
-        let mut base_f32: Vec<f32> =
-            Vec::with_capacity((base_luma.width() * base_luma.height()) as usize);
-        for (_x, _y, pixel) in base_luma.enumerate_pixels() {
-            base_f32.push(pixel[0] as f32 / 255.0);
-        }
-
-        let k = 2.0_f32.powf(1.0 / num_intervals as f32);
-        let k_pow_num_intervals = k.powi(num_intervals as i32); // ~= 2.0
-
-        // Формат текстур (один канал float)
-        let texture_format = wgpu::TextureFormat::R32Float;
-        let texture_usage = wgpu::TextureUsages::TEXTURE_BINDING |
-                              wgpu::TextureUsages::STORAGE_BINDING | // Для записи из шейдера
-                              wgpu::TextureUsages::COPY_DST |       // Для write_texture и readback
-                              wgpu::TextureUsages::COPY_SRC; // Для копирования между текстурами, если нужно
-
-        // 2. Загрузка базового изображения на GPU
-        let base_texture_desc = wgpu::TextureDescriptor {
-            label: Some("Octave 0 Base Texture"),
-            size: wgpu::Extent3d {
-                width: current_width,
-                height: current_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: texture_format,
-            usage: texture_usage,
-            view_formats: &[], // Для wgpu 0.19+
-        };
-        let mut current_octave_base_texture = self.device.create_texture(&base_texture_desc);
-        let use_cpu_downsample = env::var("SIFT_GPU_CPU_DOWNSAMPLE").is_ok();
-
-        // bytes_per_row должен быть кратен 256. Паддим данные построчно до ширины в пикселях, кратной 64 (64*4=256).
-        let row_bytes = current_width * 4; // без паддинга, ширина кратна 64 => row_bytes % 256 == 0
-        let required_row_bytes = current_width * 4;
-        eprintln!(
-            "Uploading base texture: width={}, height={}, row_bytes={}, required={}",
-            current_width, current_height, row_bytes, required_row_bytes
-        );
-        assert!(
-            row_bytes >= current_width * 4 && row_bytes % 256 == 0,
-            "Invalid bytes_per_row for texture upload"
+        // Copy counters
+        encoder.copy_buffer_to_buffer(&ctx.extrema_counter, 0, &buffers.readback_counters, 0, 4);
+        encoder.copy_buffer_to_buffer(
+            &ctx.orientation_counter,
+            0,
+            &buffers.readback_counters,
+            4,
+            4,
         );
 
-        // Создаем staging-буфер с выравниванием по 256 байт
-        let padded_row_bytes = ((row_bytes + 255) / 256) * 256;
-        let mut padded_data: Vec<f32> =
-            Vec::with_capacity((padded_row_bytes / 4 * current_height) as usize);
-        for row in 0..current_height as usize {
-            let start = row * current_width as usize;
-            let end = start + current_width as usize;
-            padded_data.extend_from_slice(&base_f32[start..end]);
-            let pad_floats = (padded_row_bytes - row_bytes) / 4;
-            if pad_floats > 0 {
-                padded_data.extend(std::iter::repeat(0.0).take(pad_floats as usize));
-            }
-        }
+        self.queue.submit(Some(encoder.finish()));
 
-        let staging_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("SIFT Base Staging"),
-            contents: bytemuck::cast_slice(&padded_data),
-            usage: wgpu::BufferUsages::COPY_SRC,
+        // Map and read counters
+        let counters_slice = buffers.readback_counters.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        counters_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
         });
 
-        let mut encoder =
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Upload Base Encoder") });
-        encoder.copy_buffer_to_texture(
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes),
-                    rows_per_image: Some(current_height),
-                },
-            },
-            current_octave_base_texture.as_image_copy(),
-            base_texture_desc.size,
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+        rx.recv()??;
+
+        let counters_data = counters_slice.get_mapped_range();
+        let orientation_count = u32::from_le_bytes([
+            counters_data[4],
+            counters_data[5],
+            counters_data[6],
+            counters_data[7],
+        ]);
+        drop(counters_data);
+        buffers.readback_counters.unmap();
+
+        let num_keypoints = orientation_count.min(65536);
+
+        // Early return if no keypoints found
+        if num_keypoints == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Copy keypoints and descriptors
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Readback KP Encoder"),
+            });
+
+        encoder.copy_buffer_to_buffer(
+            &ctx.keypoints_final,
+            0,
+            &buffers.readback_keypoints,
+            0,
+            (num_keypoints as u64) * 16,
         );
-        self.queue.submit(std::iter::once(encoder.finish()));
 
-        let mut gaussian_pyramid_gpu: Vec<Vec<wgpu::Texture>> =
-            Vec::with_capacity(num_octaves as usize);
-        let mut dog_pyramid_gpu: Vec<Vec<wgpu::Texture>> = Vec::with_capacity(num_octaves as usize);
-
-        // Переменная для хранения базовой текстуры для следующей октавы
-        // Начинаем с первой загруженной текстуры
-        let mut next_octave_base_texture =
-            Some(self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Initial Base Texture Copy"), // Копия для первой октавы
-                size: base_texture_desc.size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: texture_format,
-                usage: texture_usage,
-                view_formats: &[],
-            }));
-        let mut next_octave_base_sigma_abs = initial_sigma; // sigma базового слоя для следующей октавы
-
-        // Копируем начальное изображение в next_octave_base_texture
-        let mut initial_copy_encoder = self.device.create_command_encoder(&Default::default());
-        initial_copy_encoder.copy_texture_to_texture(
-            current_octave_base_texture.as_image_copy(), // Используем только что загруженную
-            next_octave_base_texture
-                .as_ref()
-                .expect("next_octave_base_texture is None")
-                .as_image_copy(),
-            base_texture_desc.size,
+        encoder.copy_buffer_to_buffer(
+            &ctx.descriptors,
+            0,
+            &buffers.readback_descriptors,
+            0,
+            (num_keypoints as u64) * 128,
         );
-        self.queue
-            .submit(std::iter::once(initial_copy_encoder.finish()));
 
-        let mut current_base_sigma_abs = initial_sigma;
+        self.queue.submit(Some(encoder.finish()));
 
-        for o_idx in 0..num_octaves {
-            println!("GPU: Building Octave {}", o_idx);
-            let mut current_gauss_octave: Vec<wgpu::Texture> =
-                Vec::with_capacity((num_intervals + 3) as usize);
-            let mut current_dog_octave: Vec<wgpu::Texture> =
-                Vec::with_capacity((num_intervals + 2) as usize);
+        // Map keypoints
+        let kp_slice = buffers
+            .readback_keypoints
+            .slice(..(num_keypoints as u64 * 16));
+        let (tx, rx) = std::sync::mpsc::channel();
+        kp_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
 
-            // Начинаем октаву с базовой текстуры, подготовленной на предыдущем шаге
-            current_octave_base_texture = next_octave_base_texture
-                .take()
-                .expect("next_octave_base_texture should not be None"); // Переносим владение
-            let current_size = current_octave_base_texture.size();
-            current_width = current_size.width;
-            current_height = current_size.height;
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+        rx.recv()??;
 
-            current_gauss_octave.push(current_octave_base_texture); // Добавляем базовую текстуру (слой 0)
+        let kp_data = kp_slice.get_mapped_range();
+        let mut keypoints = Vec::with_capacity(num_keypoints as usize);
 
-            // Абсолютная сигма для базового слоя текущей октавы
-            let mut prev_sigma_abs = current_base_sigma_abs;
+        for i in 0..num_keypoints as usize {
+            let offset = i * 16;
+            let x = f32::from_le_bytes([
+                kp_data[offset],
+                kp_data[offset + 1],
+                kp_data[offset + 2],
+                kp_data[offset + 3],
+            ]);
+            let y = f32::from_le_bytes([
+                kp_data[offset + 4],
+                kp_data[offset + 5],
+                kp_data[offset + 6],
+                kp_data[offset + 7],
+            ]);
+            let size = f32::from_le_bytes([
+                kp_data[offset + 8],
+                kp_data[offset + 9],
+                kp_data[offset + 10],
+                kp_data[offset + 11],
+            ]);
+            let angle = f32::from_le_bytes([
+                kp_data[offset + 12],
+                kp_data[offset + 13],
+                kp_data[offset + 14],
+                kp_data[offset + 15],
+            ]);
 
-            for s_idx in 1..(num_intervals + 3) {
-                let target_sigma_abs = current_base_sigma_abs * k.powi(s_idx as i32);
-                let blur_sigma_step = (target_sigma_abs.powi(2).max(prev_sigma_abs.powi(2))
-                    - prev_sigma_abs.powi(2))
-                .sqrt();
-                let prev_gauss_texture = current_gauss_octave.last().unwrap();
+            keypoints.push(KeyPoint {
+                x,
+                y,
+                size,
+                angle,
+                response: 0.0,
+                octave: 0,
+                layer: 0,
+            });
+        }
+        drop(kp_data);
+        buffers.readback_keypoints.unmap();
 
-                // Создаем выходную текстуру для текущего слоя Гаусса
-                let gauss_texture_label = format!("Octave {} Gaussian {}", o_idx, s_idx);
-                let current_gauss_texture_desc = wgpu::TextureDescriptor {
-                    label: Some(&gauss_texture_label),
-                    size: prev_gauss_texture.size(),
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: texture_format,
-                    usage: texture_usage,
-                    view_formats: &[],
-                };
-                let current_gauss_texture = self.device.create_texture(&current_gauss_texture_desc);
+        // Map descriptors
+        let desc_slice = buffers
+            .readback_descriptors
+            .slice(..(num_keypoints as u64 * 128));
+        let (tx, rx) = std::sync::mpsc::channel();
+        desc_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
 
-                // Создаем текстуру для DoG *заранее*, если она понадобится
-                let dog_texture_label = format!("Octave {} DoG {}", o_idx, s_idx);
-                let dog_texture: Option<wgpu::Texture> = if s_idx > 0 {
-                    let dog_texture_desc = wgpu::TextureDescriptor {
-                        label: Some(&dog_texture_label),
-                        size: prev_gauss_texture.size(),
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: texture_format,
-                        usage: texture_usage,
-                        view_formats: &[],
-                    };
-                    Some(self.device.create_texture(&dog_texture_desc))
-                } else {
-                    None
-                };
+        let _ = self.device.poll(wgpu::MaintainBase::Wait);
+        rx.recv()??;
 
-                // --- Выполнение блюра ---
-                if blur_sigma_step > 1e-4 {
-                    // Создаем временную текстуру для горизонтального прохода
-                    // Используем ту же текстуру, что и для DoG, если она есть
-                    let temp_blur_texture_label = format!("Octave {} Temp Blur {}", o_idx, s_idx);
-                    let temp_blur_texture_desc = wgpu::TextureDescriptor {
-                        label: Some(&temp_blur_texture_label),
-                        size: prev_gauss_texture.size(),
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: texture_format,
-                        usage: texture_usage,
-                        view_formats: &[],
-                    };
-                    let temp_blur_texture = self.device.create_texture(&temp_blur_texture_desc);
+        let desc_data = desc_slice.get_mapped_range();
+        let mut descriptors = Vec::with_capacity(num_keypoints as usize);
 
-                    // Горизонтальный проход
-                    let params_h = ComputeParams {
-                        /* ... */ width: current_width,
-                        height: current_height,
-                        sigma: blur_sigma_step,
-                        step_x: 1,
-                        step_y: 0,
-                        _padding1: 0,
-                        _padding2: 0,
-                    };
-                    self.queue
-                        .write_buffer(&self.param_buffer, 0, bytemuck::bytes_of(&params_h));
-                    let bind_group_h = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Blur H BindGroup O{} S{}", o_idx, s_idx)),
-                        layout: &self.texture_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.param_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &prev_gauss_texture.create_view(&Default::default()),
-                                ),
-                            },
-                            // Placeholder (same as input) to satisfy layout binding 2
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &prev_gauss_texture.create_view(&Default::default()),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &temp_blur_texture.create_view(&Default::default()),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                        ],
-                    });
-                    self.run_compute(
-                        &self.blur_pipeline_h,
-                        &bind_group_h,
-                        current_width,
-                        current_height,
-                        &format!("Blur H O{} S{}", o_idx, s_idx),
-                    );
+        for i in 0..num_keypoints as usize {
+            let offset = i * 128;
+            let mut desc = [0u8; 128];
+            desc.copy_from_slice(&desc_data[offset..offset + 128]);
+            descriptors.push(desc);
+        }
+        drop(desc_data);
+        buffers.readback_descriptors.unmap();
 
-                    // Вертикальный проход
-                    let params_v = ComputeParams {
-                        /* ... */ width: current_width,
-                        height: current_height,
-                        sigma: blur_sigma_step,
-                        step_x: 0,
-                        step_y: 1,
-                        _padding1: 0,
-                        _padding2: 0,
-                    };
-                    self.queue
-                        .write_buffer(&self.param_buffer, 0, bytemuck::bytes_of(&params_v));
-                    let bind_group_v = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("Blur V BindGroup O{} S{}", o_idx, s_idx)),
-                        layout: &self.texture_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.param_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &temp_blur_texture.create_view(&Default::default()),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &temp_blur_texture.create_view(&Default::default()),
-                                ),
-                            },
-                            // !! Исправлено: Пишем в current_gauss_texture
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &current_gauss_texture.create_view(&Default::default()),
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                        ],
-                    });
-                    self.run_compute(
-                        &self.blur_pipeline_v,
-                        &bind_group_v,
-                        current_width,
-                        current_height,
-                        &format!("Blur V O{} S{}", o_idx, s_idx),
-                    );
-                } else {
-                    // Копируем prev_gauss_texture в current_gauss_texture
-                    println!("GPU: Copying texture for O{} S{}", o_idx, s_idx);
-                    let mut encoder =
-                        self.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some(&format!("Texture Copy O{} S{}", o_idx, s_idx)),
-                            });
-                    encoder.copy_texture_to_texture(
-                        prev_gauss_texture.as_image_copy(),    // Source
-                        current_gauss_texture.as_image_copy(), // Destination
-                        prev_gauss_texture.size(),             // Extent
-                    );
-                    self.queue.submit(std::iter::once(encoder.finish()));
-                }
-
-                // --- Вычисление DoG ---
-                if let Some(dog_tex) = &dog_texture {
-                    // Используем dog_tex (текстуру, созданную ранее)
-                    let params_sub = ComputeParams {
-                        /* ... */ width: current_width,
-                        height: current_height,
-                        sigma: 0.0,
-                        step_x: 0,
-                        step_y: 0,
-                        _padding1: 0,
-                        _padding2: 0,
-                    };
-                    self.queue
-                        .write_buffer(&self.param_buffer, 0, bytemuck::bytes_of(&params_sub));
-                    let bind_group_sub =
-                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some(&format!("Subtract BindGroup O{} S{}", o_idx, s_idx - 1)),
-                            layout: &self.texture_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: self.param_buffer.as_entire_binding(),
-                                },
-                                // !! Исправлено: Используем current_gauss_texture как Gauss[s]
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &current_gauss_texture.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &prev_gauss_texture.create_view(&Default::default()),
-                                    ),
-                                }, // Gauss[s-1]
-                                wgpu::BindGroupEntry {
-                                    binding: 3,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &dog_tex.create_view(&Default::default()),
-                                    ),
-                                }, // Output DoG[s-1]
-                                wgpu::BindGroupEntry {
-                                    binding: 4,
-                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                },
-                            ],
-                        });
-                    self.run_compute(
-                        &self.subtract_pipeline,
-                        &bind_group_sub,
-                        current_width,
-                        current_height,
-                        &format!("Subtract O{} S{}", o_idx, s_idx - 1),
-                    );
-                    // !! Исправлено: Добавляем саму dog_tex в список. Копирование не нужно.
-                    current_dog_octave.push(dog_texture.unwrap()); // Мы знаем, что dog_texture is Some здесь
-                }
-
-                // Добавляем вычисленную Гауссову текстуру
-                current_gauss_octave.push(current_gauss_texture);
-                prev_sigma_abs = target_sigma_abs;
-            } // Конец цикла по s_idx
-
-            gaussian_pyramid_gpu.push(current_gauss_octave);
-            dog_pyramid_gpu.push(current_dog_octave);
-
-            // --- Подготовка к следующей октаве: Downsample ---
-            if o_idx < num_octaves - 1 {
-                let downsample_source_idx = num_intervals as usize;
-                // Проверяем, что индекс существует, прежде чем разыменовывать
-                if let Some(source_texture) = gaussian_pyramid_gpu
-                    .last()
-                    .and_then(|octave| octave.get(downsample_source_idx))
-                {
-                    next_octave_base_sigma_abs = current_base_sigma_abs * k_pow_num_intervals;
-
-                    let next_width = current_width / 2;
-                    let next_height = current_height / 2;
-                    if next_width == 0 || next_height == 0 {
-                        break;
-                    }
-
-                    // Создаем текстуру для следующей октавы
-                    let next_octave_base_texture_label =
-                        format!("Octave {} Base Texture", o_idx + 1);
-                    let next_octave_base_texture_desc = wgpu::TextureDescriptor {
-                        label: Some(&next_octave_base_texture_label),
-                        size: wgpu::Extent3d {
-                            width: next_width,
-                            height: next_height,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: texture_format,
-                        usage: texture_usage,
-                        view_formats: &[],
-                    };
-                    next_octave_base_texture =
-                        Some(self.device.create_texture(&next_octave_base_texture_desc));
-
-                    if use_cpu_downsample {
-                        println!("CPU downsample for Octave {}", o_idx + 1);
-                        let src_luma_f32 = self
-                            .read_texture_to_imagebuffer(source_texture, current_width, current_height)
-                            .await?;
-                        let src_u8 = GpuSiftContext::convert_luma_f32_to_u8(&src_luma_f32);
-                        let resized_u8 = image::imageops::resize(
-                            &src_u8,
-                            next_width,
-                            next_height,
-                            FilterType::Lanczos3,
-                        );
-                        let mut resized_f32: Vec<f32> =
-                            Vec::with_capacity((next_width * next_height) as usize);
-                        for (_x, _y, p) in resized_u8.enumerate_pixels() {
-                            resized_f32.push(p[0] as f32 / 255.0);
-                        }
-                        let row_bytes = next_width * 4;
-                        let padded_row_bytes = ((row_bytes + 255) / 256) * 256;
-                        let mut padded_data: Vec<f32> =
-                            Vec::with_capacity((padded_row_bytes / 4 * next_height) as usize);
-                        for row in 0..next_height as usize {
-                            let start = row * next_width as usize;
-                            let end = start + next_width as usize;
-                            padded_data.extend_from_slice(&resized_f32[start..end]);
-                            let pad_floats = (padded_row_bytes - row_bytes) / 4;
-                            if pad_floats > 0 {
-                                padded_data.extend(std::iter::repeat(0.0).take(pad_floats as usize));
-                            }
-                        }
-                        let staging = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Downsample Staging Buffer"),
-                            contents: bytemuck::cast_slice(&padded_data),
-                            usage: wgpu::BufferUsages::COPY_SRC,
-                        });
-                        let mut enc = self.device.create_command_encoder(&Default::default());
-                        enc.copy_buffer_to_texture(
-                            wgpu::TexelCopyBufferInfo {
-                                buffer: &staging,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(padded_row_bytes),
-                                    rows_per_image: Some(next_height),
-                                },
-                            },
-                            next_octave_base_texture
-                                .as_ref()
-                                .expect("next_octave_base_texture is None")
-                                .as_image_copy(),
-                            wgpu::Extent3d {
-                                width: next_width,
-                                height: next_height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        self.queue.submit(std::iter::once(enc.finish()));
-                    } else {
-                        println!("GPU: Downsampling for Octave {}", o_idx + 1);
-                        // Предразмытие σ=1.0 (separable blur) перед децимацией
-                        let blur_sigma = 1.0f32;
-                        // temp blur textures
-                        let blur_temp1 = self.device.create_texture(&wgpu::TextureDescriptor {
-                            label: Some(&format!("Blur Temp1 O{}", o_idx + 1)),
-                            size: source_texture.size(),
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: texture_format,
-                            usage: texture_usage,
-                            view_formats: &[],
-                        });
-                        let blur_temp2 = self.device.create_texture(&wgpu::TextureDescriptor {
-                            label: Some(&format!("Blur Temp2 O{}", o_idx + 1)),
-                            size: source_texture.size(),
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: texture_format,
-                            usage: texture_usage,
-                            view_formats: &[],
-                        });
-
-                        // Horizontal blur
-                        let params_h = ComputeParams {
-                            width: current_width,
-                            height: current_height,
-                            sigma: blur_sigma,
-                            step_x: 1,
-                            step_y: 0,
-                            _padding1: 0,
-                            _padding2: 0,
-                        };
-                        self.queue
-                            .write_buffer(&self.param_buffer, 0, bytemuck::bytes_of(&params_h));
-                        let bind_group_h = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some(&format!("Downsample Blur H O{}", o_idx + 1)),
-                            layout: &self.texture_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: self.param_buffer.as_entire_binding(),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &source_texture.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &source_texture.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 3,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &blur_temp1.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 4,
-                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                },
-                            ],
-                        });
-                        self.run_compute(
-                            &self.blur_pipeline_h,
-                            &bind_group_h,
-                            current_width,
-                            current_height,
-                            &format!("Downsample Blur H O{}", o_idx + 1),
-                        );
-
-                        // Vertical blur
-                        let params_v = ComputeParams {
-                            width: current_width,
-                            height: current_height,
-                            sigma: blur_sigma,
-                            step_x: 0,
-                            step_y: 1,
-                            _padding1: 0,
-                            _padding2: 0,
-                        };
-                        self.queue
-                            .write_buffer(&self.param_buffer, 0, bytemuck::bytes_of(&params_v));
-                        let bind_group_v = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some(&format!("Downsample Blur V O{}", o_idx + 1)),
-                            layout: &self.texture_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: self.param_buffer.as_entire_binding(),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &blur_temp1.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &blur_temp1.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 3,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &blur_temp2.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 4,
-                                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                },
-                            ],
-                        });
-                        self.run_compute(
-                            &self.blur_pipeline_v,
-                            &bind_group_v,
-                            current_width,
-                            current_height,
-                            &format!("Downsample Blur V O{}", o_idx + 1),
-                        );
-
-                        // Point-sample downsample from blur_temp2
-                        let params_down = ComputeParams {
-                            /* ... */ width: next_width,
-                            height: next_height,
-                            sigma: 0.0,
-                            step_x: 0,
-                            step_y: 0,
-                            _padding1: 0,
-                            _padding2: 0,
-                        };
-                        self.queue.write_buffer(
-                            &self.param_buffer,
-                            0,
-                            bytemuck::bytes_of(&params_down),
-                        );
-                        let bind_group_down =
-                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some(&format!("Downsample BindGroup O{}", o_idx + 1)),
-                                layout: &self.texture_bind_group_layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: self.param_buffer.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &blur_temp2.create_view(&Default::default()),
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &blur_temp2.create_view(&Default::default()),
-                                        ),
-                                    },
-                                    // !! Исправлено: Пишем в next_octave_base_texture
-                                    wgpu::BindGroupEntry {
-                                        binding: 3,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            &next_octave_base_texture
-                                                .as_ref()
-                                                .expect("next_octave_base_texture is None")
-                                                .create_view(&Default::default()),
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 4,
-                                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                                    },
-                                ],
-                            });
-                        self.run_compute(
-                            &self.downsample_pipeline,
-                            &bind_group_down,
-                            next_width,
-                            next_height,
-                            &format!("Downsample O{}", o_idx + 1),
-                        );
-                    }
-                    // current_width и current_height обновятся на следующей итерации o_idx
-                } else {
-                    eprintln!("Error: Could not get source texture for downsampling at octave {}, layer index {}", o_idx, downsample_source_idx);
-                    break; // Прерываем, если не можем получить текстуру
-                }
-            } else {
-                // Для последней октавы нам не нужна следующая базовая текстура
-                // Можно здесь очистить next_octave_base_texture, если управление памятью важно
-            }
-
-            // Готовим sigma для следующей итерации
-            current_base_sigma_abs = next_octave_base_sigma_abs;
-        } // Конец цикла по o_idx
-        Ok((gaussian_pyramid_gpu, dog_pyramid_gpu))
+        Ok((keypoints, descriptors))
     }
 }
 
-// --- Обновленная функция верхнего уровня ---
-pub fn sift_detect_and_compute_gpu(
-    img: &DynamicImage,
-    params: &Sift,
-) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
-    let _ = env_logger::try_init();
+impl GpuSiftBuffers {
+    fn new(device: &wgpu::Device, _width: u32, _height: u32) -> Self {
+        // Initialize with minimal buffers
+        let heap = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Pyramid Heap"),
+            size: 1024,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
-    pollster::block_on(async {
-        let gpu_context = GpuSiftContext::new().await?;
-        let use_cpu_gauss = env::var("SIFT_GPU_CPU_GAUSS").is_ok();
-        let compare_pyramids = env::var("SIFT_GPU_COMPARE").is_ok();
+        let meta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Metadata"),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        let gray_img = img.to_luma8();
-        let initial_blur_amount = if params.sigma > params.assumed_blur {
-            (params.sigma.powi(2) - params.assumed_blur.powi(2)).sqrt()
-        } else {
-            0.0
-        };
-        let base_image_cpu = if initial_blur_amount > 1e-4 {
-            imageproc::filter::gaussian_blur_f32(&gray_img, initial_blur_amount)
-        } else {
-            gray_img.clone()
-        };
-        let base_image_dyn = DynamicImage::ImageLuma8(base_image_cpu);
+        let level_offsets = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Level Offsets"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        // Ветка: строим Gaussian pyramid на CPU внутри GPU пути (для диагностики/сверки)
-        if use_cpu_gauss {
-            println!("Using CPU Gaussian pyramid inside GPU path (SIFT_GPU_CPU_GAUSS set).");
-            let cpu_gauss_pyramid = params.generate_gaussian_pyramid(&base_image_dyn.to_luma8());
-            let cpu_dog_pyramid = params.generate_dog_pyramid(&cpu_gauss_pyramid);
+        let level_widths = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Level Widths"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-            let initial_keypoints = params.find_scale_space_extrema(&cpu_dog_pyramid);
-            let refined_keypoints =
-                params.refine_and_filter_extrema(&initial_keypoints, &cpu_dog_pyramid);
-            let oriented_keypoints =
-                params.assign_orientations(&refined_keypoints, &cpu_gauss_pyramid);
-            let descriptors = params.compute(&cpu_gauss_pyramid, &oriented_keypoints);
+        let level_heights = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Level Heights"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-            return Ok((oriented_keypoints, descriptors));
+        let extrema_counter = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Extrema Counter"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let keypoints_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Keypoints Staging"),
+            size: 32768 * 16, // 32768 keypoints × 4 f32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let orientation_counter = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Orientation Counter"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let keypoints_final = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Keypoints Final"),
+            size: 65536 * 16, // 65536 keypoints × 4 f32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let descriptors = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Descriptors"),
+            size: 65536 * 128, // 65536 descriptors × 128 bytes
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let readback_counters = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Readback Counters"),
+            size: 8, // 2 u32 counters
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let readback_keypoints = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Readback Keypoints"),
+            size: 65536 * 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let readback_descriptors = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Readback Descriptors"),
+            size: 65536 * 128,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            heap,
+            heap_capacity: 1024,
+            meta_buffer,
+            level_offsets,
+            level_widths,
+            level_heights,
+            kernel_buffers: Vec::new(), // Will be initialized later with actual kernels
+            extrema_counter,
+            keypoints_staging,
+            orientation_counter,
+            keypoints_final,
+            descriptors,
+            readback_counters,
+            readback_keypoints,
+            readback_descriptors,
+            current_width: 0,
+            current_height: 0,
+        }
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        config: &GpuSiftConfig,
+    ) {
+        // Check if we need to reallocate
+        if width == self.current_width && height == self.current_height {
+            return;
         }
 
-        let (gpu_gauss_pyramid, gpu_dog_pyramid) = gpu_context
-            .build_pyramids_gpu(
-                &base_image_dyn,
-                params.num_octaves,
-                params.num_intervals,
-                params.sigma,
-                params.assumed_blur,
-            )
-            .await?;
+        // Compute required heap size
+        let mut total_pixels = 0u64;
+        let mut w = width;
+        let mut h = height;
 
-        let mut cpu_gauss_pyramid: Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> = Vec::new();
-        let mut cpu_dog_pyramid: Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> = Vec::new();
-
-        // --- Чтение пирамид с GPU (пустой цикл) ---
-        for octave_textures in gpu_gauss_pyramid.iter() {
-            let mut cpu_octave: Vec<ImageBuffer<Luma<f32>, Vec<f32>>> = Vec::new();
-            for texture in octave_textures {
-                let (w, h) = (texture.width(), texture.height());
-                let luma_f32 = gpu_context
-                    .read_texture_to_imagebuffer(texture, w, h)
-                    .await?;
-                cpu_octave.push(luma_f32);
+        for _ in 0..config.octaves {
+            for _ in 0..config.scales {
+                total_pixels += (w * h) as u64;
             }
-            cpu_gauss_pyramid.push(cpu_octave);
-        }
-        for octave_textures in gpu_dog_pyramid.iter() {
-            let mut cpu_octave: Vec<ImageBuffer<Luma<f32>, Vec<f32>>> = Vec::new();
-            for texture in octave_textures {
-                let (w, h) = (texture.width(), texture.height());
-                let luma_f32 = gpu_context
-                    .read_texture_to_imagebuffer(texture, w, h)
-                    .await?;
-                cpu_octave.push(luma_f32);
-            }
-            cpu_dog_pyramid.push(cpu_octave);
-        }
-        // --- Конец чтения ---
-
-        if compare_pyramids {
-            println!("Comparing GPU pyramids vs CPU reference...");
-            // CPU reference pyramids
-            let cpu_gauss_ref_u8 = params.generate_gaussian_pyramid(&base_image_dyn.to_luma8());
-            let cpu_gauss_ref_f32: Vec<Vec<ImageBuffer<Luma<f32>, Vec<f32>>>> = cpu_gauss_ref_u8
-                .iter()
-                .map(|octave| {
-                    octave
-                        .iter()
-                        .map(|img| {
-                            let (w, h) = img.dimensions();
-                            let mut out = ImageBuffer::new(w, h);
-                            for y in 0..h {
-                                for x in 0..w {
-                                    out.put_pixel(x, y, Luma([img.get_pixel(x, y)[0] as f32 / 255.0]));
-                                }
-                            }
-                            out
-                        })
-                        .collect()
-                })
-                .collect();
-            let cpu_dog_ref = params.generate_dog_pyramid(&cpu_gauss_ref_u8);
-
-            // Compare Gauss
-            for (o_idx, (gpu_oct, cpu_oct)) in cpu_gauss_pyramid
-                .iter()
-                .zip(cpu_gauss_ref_f32.iter())
-                .enumerate()
-            {
-                for (l_idx, (gpu_img, cpu_img)) in gpu_oct.iter().zip(cpu_oct.iter()).enumerate() {
-                    if gpu_img.dimensions() != cpu_img.dimensions() {
-                        println!(
-                            "Gauss O{} L{}: size mismatch gpu {:?} cpu {:?}",
-                            o_idx,
-                            l_idx,
-                            gpu_img.dimensions(),
-                            cpu_img.dimensions()
-                        );
-                        continue;
-                    }
-                    let (mean_diff, max_diff) =
-                        GpuSiftContext::image_abs_diff_stats_f32(gpu_img, cpu_img);
-                    println!(
-                        "Gauss O{} L{}: mean_abs_diff={:.6}, max_abs_diff={:.6}",
-                        o_idx, l_idx, mean_diff, max_diff
-                    );
-                }
-            }
-
-            // Compare DoG
-            for (o_idx, (gpu_oct, cpu_oct)) in cpu_dog_pyramid
-                .iter()
-                .zip(cpu_dog_ref.iter())
-                .enumerate()
-            {
-                for (l_idx, (gpu_img, cpu_img_u8)) in gpu_oct.iter().zip(cpu_oct.iter()).enumerate() {
-                    // convert cpu dog to f32 (already f32 in ref)
-                    let (w, h) = cpu_img_u8.dimensions();
-                    let mut cpu_img = ImageBuffer::new(w, h);
-                    for y in 0..h {
-                        for x in 0..w {
-                            cpu_img.put_pixel(x, y, Luma([cpu_img_u8.get_pixel(x, y)[0]]));
-                        }
-                    }
-
-                    if gpu_img.dimensions() != cpu_img.dimensions() {
-                        println!(
-                            "DoG O{} L{}: size mismatch gpu {:?} cpu {:?}",
-                            o_idx,
-                            l_idx,
-                            gpu_img.dimensions(),
-                            cpu_img.dimensions()
-                        );
-                        continue;
-                    }
-                    let (mean_diff, max_diff) =
-                        GpuSiftContext::image_abs_diff_stats_f32(gpu_img, &cpu_img);
-                    println!(
-                        "DoG O{} L{}: mean_abs_diff={:.6}, max_abs_diff={:.6}",
-                        o_idx, l_idx, mean_diff, max_diff
-                    );
-                }
+            w /= 2;
+            h /= 2;
+            if w < 8 || h < 8 {
+                break;
             }
         }
 
-        let initial_keypoints = params.find_scale_space_extrema(&cpu_dog_pyramid);
-        let refined_keypoints =
-            params.refine_and_filter_extrema(&initial_keypoints, &cpu_dog_pyramid);
-        let oriented_keypoints =
-            params.assign_orientations_f32(&refined_keypoints, &cpu_gauss_pyramid);
-        let descriptors = params.compute_f32(&cpu_gauss_pyramid, &oriented_keypoints);
+        let heap_size = total_pixels * 2; // 2 bytes per f16 pixel
 
-        Ok((oriented_keypoints, descriptors))
-    })
+        if heap_size > self.heap_capacity {
+            // Reallocate heap
+            self.heap = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Pyramid Heap"),
+                size: heap_size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.heap_capacity = heap_size;
+        }
+
+        self.current_width = width;
+        self.current_height = height;
+    }
+
+    fn initialize_kernel_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        kernels: &GpuKernels,
+    ) {
+        self.kernel_buffers = kernels
+            .kernels
+            .iter()
+            .enumerate()
+            .map(|(i, weights)| {
+                let weights_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("Kernel Weights {}", i)),
+                    size: weights_bytes.len() as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                queue.write_buffer(&buffer, 0, &weights_bytes);
+                buffer
+            })
+            .collect();
+    }
 }

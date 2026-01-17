@@ -9,22 +9,59 @@ use std::env;
 use std::io;
 use std::time::Instant;
 
-fn detect_backend() -> SiftBackend {
-    match env::var("SIFT_BACKEND") {
-        Ok(value) => value.parse().unwrap_or_else(|err| {
-            eprintln!(
-                "Unknown SIFT_BACKEND value '{}': {}. Falling back to default backend.",
-                value, err
-            );
-            SiftBackend::default()
-        }),
-        Err(_) => SiftBackend::default(),
+fn print_usage() {
+    eprintln!("Usage: sift [--backend cpu|gpu|gpu-fallback] <image_path>");
+    eprintln!("  --backend cpu          Use CPU backend (default)");
+    eprintln!("  --backend gpu          Use GPU (WebGPU) backend");
+    eprintln!("  --backend gpu-fallback Use GPU with CPU fallback");
+    eprintln!();
+    eprintln!("Environment variable SIFT_BACKEND can also be used.");
+}
+
+fn parse_args() -> Result<(SiftBackend, String), String> {
+    let args: Vec<String> = env::args().collect();
+    
+    let mut backend: Option<SiftBackend> = None;
+    let mut image_path: Option<String> = None;
+    let mut i = 1;
+    
+    while i < args.len() {
+        if args[i] == "--backend" {
+            if i + 1 >= args.len() {
+                return Err("--backend requires a value".to_string());
+            }
+            backend = Some(args[i + 1].parse().map_err(|e| format!("{}", e))?);
+            i += 2;
+        } else if args[i] == "--help" || args[i] == "-h" {
+            print_usage();
+            std::process::exit(0);
+        } else if !args[i].starts_with('-') {
+            image_path = Some(args[i].clone());
+            i += 1;
+        } else {
+            return Err(format!("Unknown argument: {}", args[i]));
+        }
     }
+    
+    // Fallback to environment variable if no CLI backend specified
+    let backend = backend.unwrap_or_else(|| {
+        env::var("SIFT_BACKEND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default()
+    });
+    
+    let image_path = image_path.ok_or_else(|| "No image path provided".to_string())?;
+    
+    Ok((backend, image_path))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let image_path = "data/1.jpg";
-    let backend = detect_backend();
+    let (backend, image_path) = parse_args().map_err(|e| {
+        eprintln!("Error: {}", e);
+        print_usage();
+        io::Error::new(io::ErrorKind::InvalidInput, e)
+    })?;
 
     if std::fs::create_dir_all("data").is_err() {
         eprintln!(
@@ -33,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Loading image from: {}", image_path);
-    let img_dyn = match load_image_dyn(image_path) {
+    let img_dyn = match load_image_dyn(&image_path) {
         Ok(img) => img,
         Err(e) => {
             eprintln!("Error loading image '{}': {}", image_path, e);

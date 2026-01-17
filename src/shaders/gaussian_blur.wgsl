@@ -1,82 +1,83 @@
 // gaussian_blur.wgsl
+// Separable Gaussian blur: applies 1D blur in X or Y direction
+// Uses precomputed kernel weights from GPU buffer
 
-struct Params {
+// ===== Bind Groups =====
+// @group(0): input/output heap regions
+@group(0) @binding(0) var<storage, read> heap_in: array<u32>;
+@group(0) @binding(1) var<storage, read_write> heap_out: array<u32>;
+
+// @group(1): blur parameters
+struct BlurParams {
+    offset_in: u32,    // base offset in heap_in
+    offset_out: u32,   // base offset in heap_out
     width: u32,
     height: u32,
-    sigma: f32,
-    step_x: u32,
-    step_y: u32,
-    _padding1: u32,
-    _padding2: u32,
-}; // Структура должна совпадать с host-стороной ComputeParams.
-
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var texture_in: texture_2d<f32>;
-// binding(2) оставляем как заглушку, чтобы совпасть с общим BindGroupLayout
-@group(0) @binding(2) var texture_aux: texture_2d<f32>;
-@group(0) @binding(3) var texture_out: texture_storage_2d<r32float, write>; // Float формат
-@group(0) @binding(4) var samp: sampler; // Не используется, но оставлен для совместимости
-
-fn mirror_coord(c: i32, max_v: i32) -> i32 {
-    if (c < 0) {
-        return -c;
-    }
-    if (c >= max_v) {
-        return 2 * max_v - 2 - c;
-    }
-    return c;
+    kernel_size: u32,  // number of weights
+    direction: u32,    // 0=horizontal, 1=vertical
 }
 
-// Динамический радиус ~ ceil(4*sigma)
-fn kernel_radius(sigma: f32) -> i32 {
-    let r = i32(ceil(4.0 * sigma));
-    return max(r, 1);
+@group(1) @binding(0) var<uniform> params: BlurParams;
+@group(1) @binding(1) var<storage, read> kernel_weights: array<f32>; // precomputed Gaussian
+
+// ===== F16 Packing =====
+fn read_pixel_f16(base_offset: u32, x: u32, y: u32, width: u32) -> f32 {
+    let idx = y * width + x;
+    let word_idx = idx >> 1u;
+    let is_high = (idx & 1u) != 0u;
+    let packed = heap_in[base_offset + word_idx];
+    let unpacked = unpack2x16float(packed);
+    return select(unpacked.x, unpacked.y, is_high);
 }
 
-@compute @workgroup_size(8, 8, 1) // Размер рабочей группы (можно настроить)
-fn main_blur(@builtin(global_invocation_id) id: vec3<u32>) {
-    let out_coord = vec2<i32>(i32(id.x), i32(id.y));
+fn write_pixel_f16(base_offset: u32, x: u32, y: u32, width: u32, value: f32) {
+    let idx = y * width + x;
+    let word_idx = idx >> 1u;
+    let is_high = (idx & 1u) != 0u;
+    
+    // Read existing word
+    let old_packed = heap_out[base_offset + word_idx];
+    let old_unpacked = unpack2x16float(old_packed);
+    
+    // Update appropriate half
+    let new_unpacked = select(
+        vec2<f32>(value, old_unpacked.y),
+        vec2<f32>(old_unpacked.x, value),
+        is_high
+    );
+    
+    heap_out[base_offset + word_idx] = pack2x16float(new_unpacked);
+}
 
-    // Проверка выхода за границы выходной текстуры
-    if (out_coord.x >= i32(params.width) || out_coord.y >= i32(params.height)) {
+@compute @workgroup_size(16, 16, 1)
+fn gaussian_blur(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let x = global_id.x;
+    let y = global_id.y;
+    
+    if (x >= params.width || y >= params.height) {
         return;
     }
-
-    if (params.sigma <= 0.0) {
-        let mx = mirror_coord(out_coord.x, i32(params.width));
-        let my = mirror_coord(out_coord.y, i32(params.height));
-        let texel = textureLoad(texture_in, vec2<i32>(mx, my), 0);
-        textureStore(texture_out, out_coord, vec4<f32>(texel.r, 0.0, 0.0, 1.0));
-        return;
+    
+    let radius = i32(params.kernel_size / 2u);
+    var sum: f32 = 0.0;
+    
+    if (params.direction == 0u) {
+        // Horizontal blur
+        for (var i = 0u; i < params.kernel_size; i++) {
+            let offset = i32(i) - radius;
+            let sample_x = clamp(i32(x) + offset, 0, i32(params.width) - 1);
+            let pixel_val = read_pixel_f16(params.offset_in, u32(sample_x), y, params.width);
+            sum += pixel_val * kernel_weights[i];
+        }
+    } else {
+        // Vertical blur
+        for (var i = 0u; i < params.kernel_size; i++) {
+            let offset = i32(i) - radius;
+            let sample_y = clamp(i32(y) + offset, 0, i32(params.height) - 1);
+            let pixel_val = read_pixel_f16(params.offset_in, x, u32(sample_y), params.width);
+            sum += pixel_val * kernel_weights[i];
+        }
     }
-
-    let radius = kernel_radius(params.sigma);
-    let sigma2 = params.sigma * params.sigma;
-
-    var accumulated: f32 = 0.0;
-    var total_weight: f32 = 0.0;
-
-    // Цикл по ядру свертки
-    for (var i: i32 = -radius; i <= radius; i = i + 1) {
-        // Координаты для чтения из входной текстуры
-        let read_coord = out_coord + vec2<i32>(i * i32(params.step_x), i * i32(params.step_y));
-
-        // Чтение без сэмплера, используя зеркальное отражение на границах
-        let mx = mirror_coord(read_coord.x, i32(params.width));
-        let my = mirror_coord(read_coord.y, i32(params.height));
-        let texel = textureLoad(texture_in, vec2<i32>(mx, my), 0);
-
-        // Гауссов вес
-        let offset = f32(i);
-        let weight: f32 = exp(-0.5 * (offset * offset) / sigma2);
-
-        accumulated = accumulated + texel.r * weight;
-        total_weight = total_weight + weight;
-    }
-
-    if (total_weight > 0.0) {
-        accumulated = accumulated / total_weight;
-    }
-
-    textureStore(texture_out, out_coord, vec4<f32>(accumulated, 0.0, 0.0, 1.0));
+    
+    write_pixel_f16(params.offset_out, x, y, params.width, sum);
 }

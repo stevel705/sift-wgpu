@@ -34,3 +34,8 @@ bytemuck = { version = "1.23.0", features = ["derive"] } # Для безопас
 log = "0.4.27" # wgpu использует логгирование
 env_logger = "0.11.8" # Простой логгер для примера
 futures-intrusive = "0.5" # Для использования futures в wgpu
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] } # Для GPU backend runtime
+half = "2.4" # Для f16 конвертации в GPU пайплайне
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] } # Additional features for tests

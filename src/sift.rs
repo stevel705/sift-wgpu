@@ -4,7 +4,6 @@ use imageproc::filter::gaussian_blur_f32;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 
-use crate::gpu_sift::sift_detect_and_compute_gpu;
 use crate::{keypoints::KeyPoint, SiftBackend};
 use log::warn;
 
@@ -721,6 +720,7 @@ impl Sift {
             .collect() // Собираем результаты от всех потоков в один Vec<KeyPoint>
     }
 
+    #[allow(dead_code)]
     pub(crate) fn assign_orientations_f32(
         &self,
         keypoints: &[KeyPoint],
@@ -769,20 +769,10 @@ impl Sift {
                         {
                             continue;
                         }
-                        let grad_x =
-                            Self::get_gauss_pixel_value_f32(gauss_image, x_img + 1, y_img)
-                                - Self::get_gauss_pixel_value_f32(
-                                    gauss_image,
-                                    x_img - 1,
-                                    y_img,
-                                );
-                        let grad_y =
-                            Self::get_gauss_pixel_value_f32(gauss_image, x_img, y_img + 1)
-                                - Self::get_gauss_pixel_value_f32(
-                                    gauss_image,
-                                    x_img,
-                                    y_img - 1,
-                                );
+                        let grad_x = Self::get_gauss_pixel_value_f32(gauss_image, x_img + 1, y_img)
+                            - Self::get_gauss_pixel_value_f32(gauss_image, x_img - 1, y_img);
+                        let grad_y = Self::get_gauss_pixel_value_f32(gauss_image, x_img, y_img + 1)
+                            - Self::get_gauss_pixel_value_f32(gauss_image, x_img, y_img - 1);
                         let magnitude = (grad_x * grad_x + grad_y * grad_y).sqrt();
                         let angle = grad_y.atan2(grad_x);
                         let weight =
@@ -1253,14 +1243,59 @@ impl Sift {
     ) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
         match backend {
             SiftBackend::Cpu => Ok(self.detect_and_compute_cpu(img)),
-            SiftBackend::WebGpu => sift_detect_and_compute_gpu(img, self),
-            SiftBackend::WebGpuWithCpuFallback => match sift_detect_and_compute_gpu(img, self) {
-                Ok(result) => Ok(result),
-                Err(err) => {
-                    warn!("WebGPU backend failed ({}). Falling back to CPU SIFT.", err);
-                    Ok(self.detect_and_compute_cpu(img))
+            SiftBackend::WebGpu => {
+                // Use GPU implementation
+                use crate::gpu_sift::{GpuSiftConfig, GpuSiftContext};
+
+                let gray = img.to_luma8();
+                let (width, height) = gray.dimensions();
+                let pixels = gray.into_raw();
+
+                let config = GpuSiftConfig {
+                    octaves: self.num_octaves,
+                    scales: self.num_intervals + 3, // SIFT uses s+3 scales per octave
+                    base_sigma: self.sigma,
+                    contrast_threshold: self.contrast_threshold,
+                    edge_threshold: self.edge_threshold,
+                };
+
+                // Run GPU detection synchronously using tokio
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+                    rt.block_on(async {
+                        let ctx = GpuSiftContext::new(config)
+                            .await
+                            .map_err(|e| format!("GPU init failed: {}", e))?;
+
+                        ctx.detect(&pixels, width, height)
+                            .await
+                            .map_err(|e| format!("GPU detection failed: {}", e))
+                    })
+                })
+                .join()
+                .map_err(|_| "GPU thread panicked".to_string())??;
+
+                // Convert [u8; 128] descriptors to Vec<f32>
+                let (keypoints, descriptors_u8) = result;
+                let descriptors: Vec<Vec<f32>> = descriptors_u8
+                    .into_iter()
+                    .map(|d| d.iter().map(|&v| v as f32 / 255.0).collect())
+                    .collect();
+
+                Ok((keypoints, descriptors))
+            }
+            SiftBackend::WebGpuWithCpuFallback => {
+                // Try GPU, fallback to CPU
+                match self.detect_and_compute_with_backend(img, SiftBackend::WebGpu) {
+                    Ok(result) => Ok(result),
+                    Err(e) => {
+                        warn!("WebGPU failed ({}), falling back to CPU.", e);
+                        Ok(self.detect_and_compute_cpu(img))
+                    }
                 }
-            },
+            }
         }
     }
 

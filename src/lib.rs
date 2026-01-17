@@ -5,7 +5,7 @@ pub mod sift;
 use std::str::FromStr;
 
 // Реэкспорт основных типов
-pub use gpu_sift::sift_detect_and_compute_gpu;
+pub use gpu_sift::{GpuSiftConfig, GpuSiftContext};
 pub use keypoints::KeyPoint;
 pub use sift::{convert_f32_to_grayimage_normalized, load_image_dyn, save_gray_image, Sift};
 
