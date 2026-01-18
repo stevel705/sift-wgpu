@@ -22,6 +22,10 @@ fn main() {
 cargo run --release --example sift path/to/image.jpg
 ```
 
+```sh
+cargo build --release 2>&1 | tail -2 && SIFT_PROFILE=1 ./target/release/sift --backend gpuv2 data/lenna.png 2>&1
+```
+
 ## References
 
 - [Lowe, D. G. (2004). Distinctive image features from scale-invariant keypoints. International Journal of Computer Vision, 60(2), 91-110.](https://www.cs.ubc.ca/~lowe/papers/ijcv04.pdf)
