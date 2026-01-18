@@ -250,7 +250,7 @@ def main():
     results["cpu"] = benchmark_sift_rs(binary_path, image_path, "cpu", args.runs)
 
     # sift-rs GPU
-    results["gpu"] = benchmark_sift_rs(binary_path, image_path, "gpu", args.runs)
+    results["gpu"] = benchmark_sift_rs(binary_path, image_path, "gpuv2", args.runs)
 
     # Display results table
     table = Table(title="Benchmark Results")

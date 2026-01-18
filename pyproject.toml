@@ -1,0 +1,7 @@
+[project]
+name = "sift-rs-bench"
+version = "0.1.0"
+description = "Benchmarks for SIFT-rs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["matplotlib>=3.0.0", "pandas>=1.0.0"]

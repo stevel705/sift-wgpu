@@ -3,12 +3,18 @@ name = "sift-rs"
 version = "0.1.0"
 edition = "2021"
 authors = ["Alexandr Meshkov <stevel705@outlook.com>"]
-description = "SIFT implementation in Rust"
+description = "High-performance SIFT (Scale-Invariant Feature Transform) implementation in Rust with CPU and WebGPU backends."
 license = "MIT"
 repository = "https://github.com/stevel705/sift-rs"
 readme = "README.md"
-keywords = ["sift", "feature-detection", "image-processing", "computer-vision"]
-categories = ["image-processing", "computer-vision"]
+keywords = [
+    "sift",
+    "feature-detection",
+    "image-processing",
+    "computer-vision",
+    "webgpu",
+]
+categories = ["computer-vision", "multimedia::images"]
 documentation = "https://docs.rs/sift-rs"
 homepage = "https://github.com/stevel705/sift-rs"
 

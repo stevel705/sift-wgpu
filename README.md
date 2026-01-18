@@ -184,6 +184,27 @@ run();
 - **CPU**: Uses optimized SIMD (via `wasm-opt`) but is single-threaded in the browser. Fast for 320p/480p, slower for HD.
 - **WebGPU**: High initialization cost but scales well with resolution (720p+). Requires optimized texture pipeline (V2) which is the default in the web binding.
 
+## Benchmarks
+
+This repository includes a Python-based benchmark suite to compare CPU and GPU backends.
+
+### Prerequisites
+
+- [uv](https://github.com/astral-sh/uv) (fast Python package manager)
+- Rust toolchain
+
+### Running Benchmarks
+
+```sh
+# Build the release binary first
+cargo build --release
+
+# Run benchmarks using uv (handles dependencies automatically)
+uv run bench/benchmark.py
+```
+
+This will run SIFT on different backends and resolutions, generating a performance comparison.
+
 ### CLI Options
 
 ```
@@ -252,8 +273,8 @@ src/
 - [x] Add WebGPU support (V1 & V2)
 - [x] Add WASM support
 - [x] Add Web Demo with Camera
-- [ ] Add documentation
-- [ ] Add benchmarks
+- [x] Add documentation
+- [x] Add benchmarks
 
 ## License
 

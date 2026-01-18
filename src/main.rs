@@ -1,9 +1,9 @@
 // src/main.rs
 
-// Используем имя библиотеки 'sift', а не имя пакета 'sift_rs'
+// Use library crate name 'sift' instead of package name 'sift_rs'
 use image::Rgb;
-use sift::draw_keypoints_to_image; // Импортируем новую функцию
-use sift::sift::{load_image_dyn, Sift}; // Импортируем Rgb для указания цвета
+use sift::draw_keypoints_to_image; // Import drawing function
+use sift::sift::{load_image_dyn, Sift}; // Import Rgb for color
 use sift::SiftBackend;
 use std::env;
 use std::io;
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(img) => img,
         Err(e) => {
             eprintln!("Error loading image '{}': {}", image_path, e);
-            // ... (сообщения об ошибке) ...
+            // ... (error messages) ...
             return Err(e.into());
         }
     };
@@ -91,40 +91,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // );
     println!("Selected SIFT backend: {:?}", backend);
 
-    // Используем параметры SIFT по умолчанию
+    // Use default SIFT parameters
     let sift = Sift::default();
 
     println!("Detecting SIFT keypoints and computing descriptors...");
-    // Используем новый метод, возвращающий и точки, и дескрипторы
+    // Use new method returning both keypoints and descriptors
     let start_time = Instant::now();
     let (keypoints, descriptors) = sift
         .detect_and_compute_with_backend(&img_dyn, backend)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let duration = start_time.elapsed();
 
-    println!("SIFT processing took: {:?}", duration); // <--- Вывод времени
+    println!("SIFT processing took: {:?}", duration); // <--- Output time
     println!("Found {} keypoints.", keypoints.len());
     println!("Computed {} descriptors.", descriptors.len());
 
     if !keypoints.is_empty() {
-        // Выводим информацию о первой точке для примера
+        // Print info about the first point as an example
         println!("Example keypoint [0]: x={:.2}, y={:.2}, size={:.2}, angle={:.2}, response={:.4}, octave={}, layer={}",
-                 keypoints[0].x, keypoints[0].y, keypoints[0].size, keypoints[0].angle.to_degrees(), // Угол в градусах для наглядности
+                 keypoints[0].x, keypoints[0].y, keypoints[0].size, keypoints[0].angle.to_degrees(), // Angle in degrees for clarity
                  keypoints[0].response, keypoints[0].octave, keypoints[0].layer);
 
-        // Выводим размер первого дескриптора
+        // Print size of the first descriptor
         if !descriptors.is_empty() {
             println!("Example descriptor [0] length: {}", descriptors[0].len());
-            // Можно вывести первые несколько значений дескриптора
+            // Can print first few descriptor values
             println!(
                 "Example descriptor [0] values (first 10): {:?}",
                 &descriptors[0][..10.min(descriptors[0].len())]
             );
         }
 
-        // --- Визуализация ---
+        // --- Visualization ---
         println!("Drawing keypoints on image...");
-        let color = Rgb([255u8, 0, 0]); // Красный цвет
+        let color = Rgb([255u8, 0, 0]); // Red color
         let image_with_keypoints = draw_keypoints_to_image(&img_dyn, &keypoints, color);
 
         let output_path = format!("data/output_{:?}.png", backend);
@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!("PNG output image saved successfully.");
         }
-        // --- Конец Визуализации ---
+        // --- End Visualization ---
     } else {
         println!("No keypoints found.");
     }
