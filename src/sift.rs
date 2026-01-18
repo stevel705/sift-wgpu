@@ -1,37 +1,37 @@
+use crate::utils::*;
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::filter::gaussian_blur_f32;
-use rayon::prelude::*;
 use std::f32::consts::PI;
 
 use crate::{keypoints::KeyPoint, SiftBackend};
 use log::warn;
 
-// Параметры SIFT по умолчанию, основанные на статье Лоу и распространенных реализациях
+// Sift parameters based on Lowe's paper and common implementations
 const DEFAULT_SIGMA: f32 = 1.6;
-const DEFAULT_NUM_OCTAVES: u32 = 4; // Можно вычислять на основе размера изображения
-pub const DEFAULT_NUM_INTERVALS: u32 = 3; // S в статье Лоу (количество интервалов DoG для поиска экстремумов)
-const DEFAULT_ASSUMED_BLUR: f32 = 0.5; // Предполагаемое размытие входного изображения
+const DEFAULT_NUM_OCTAVES: u32 = 4; // Can be computed based on image size
+pub const DEFAULT_NUM_INTERVALS: u32 = 3; // S in Lowe's paper (number of DoG intervals for extrema detection)
+const DEFAULT_ASSUMED_BLUR: f32 = 0.5; // Assumed blur of the input image
 const DEFAULT_CONTRAST_THRESHOLD: f32 = 0.04;
 const DEFAULT_EDGE_THRESHOLD: f32 = 10.0;
-const DEFAULT_IMAGE_BORDER_WIDTH: u32 = 5; // Ширина границы, игнорируемой при поиске точек
-const MAX_INTERPOLATION_STEPS: usize = 5; // Макс. число шагов интерполяции
-const INTERPOLATION_OFFSET_THRESHOLD: f32 = 0.5; // Порог смещения для интерполяции
-                                                 // Другие параметры, которые могут быть добавлены позже:
-const ORIENTATION_HIST_BINS: usize = 36; // Количество бинов в гистограмме ориентаций
-const ORIENTATION_WINDOW_RADIUS_FACTOR: f32 = 3.0; // Радиус окна = factor * 1.5 * sigma_octave
-const ORIENTATION_SMOOTHING_ITERATIONS: usize = 2; // Количество проходов сглаживания гистограммы
-const ORIENTATION_PEAK_RATIO: f32 = 0.8; // Порог для вторичных пиков ориентации
-const ORIENTATION_GAUSSIAN_EXPANSION_FACTOR: f32 = 1.5; // sigma для гауссова взвешивания = factor * sigma_octave
+const DEFAULT_IMAGE_BORDER_WIDTH: u32 = 5; // Border width ignored when finding points
+const MAX_INTERPOLATION_STEPS: usize = 5; // Max number of interpolation steps
+const INTERPOLATION_OFFSET_THRESHOLD: f32 = 0.5; // Offset threshold for interpolation
+                                                 // Other parameters that can be added later:
+const ORIENTATION_HIST_BINS: usize = 36; // Number of bins in orientation histogram
+const ORIENTATION_WINDOW_RADIUS_FACTOR: f32 = 3.0; // Window radius = factor * 1.5 * sigma_octave
+const ORIENTATION_SMOOTHING_ITERATIONS: usize = 2; // Number of histogram smoothing passes
+const ORIENTATION_PEAK_RATIO: f32 = 0.8; // Threshold for secondary orientation peaks
+const ORIENTATION_GAUSSIAN_EXPANSION_FACTOR: f32 = 1.5; // sigma for Gaussian weighting = factor * sigma_octave
 
-// Константы для дескриптора
-const DESC_HIST_BINS: usize = 8; // Количество бинов ориентации в гистограмме дескриптора
-const DESC_WINDOW_WIDTH: usize = 4; // Ширина сетки дескриптора (4x4)
-const DESC_MAG_THR: f32 = 0.2; // Порог для обрезки магнитуд в дескрипторе
+// Descriptor constants
+const DESC_HIST_BINS: usize = 8; // Number of orientation bins in descriptor histogram
+const DESC_WINDOW_WIDTH: usize = 4; // Descriptor grid width (4x4)
+const DESC_MAG_THR: f32 = 0.2; // Threshold for magnitude clipping in descriptor
 const DESC_PATCH_SCALE_FACTOR: f32 = 3.0;
-// const DESC_INT_FACTOR: f32 = 512.0; // Множитель для преобразования в байты (не используется здесь, но часто в impl)
-// Коэффициент масштабирования окна дескриптора относительно sigma точки
-// Окно будет DESC_WINDOW_WIDTH * patch_size_factor пикселей в ширину в масштабе sigma точки
+// const DESC_INT_FACTOR: f32 = 512.0; // Multiplier for conversion to bytes (not used here, but often in impl)
+// Coefficient for scaling descriptor window relative to point sigma
+// Window will be DESC_WINDOW_WIDTH * patch_size_factor pixels wide in point sigma scale
 
 pub struct Sift {
     pub sigma: f32,
@@ -39,9 +39,9 @@ pub struct Sift {
     pub num_intervals: u32, // S
     pub assumed_blur: f32,
     pub contrast_threshold: f32,
-    pub edge_threshold: f32, // Пока не используется
+    pub edge_threshold: f32, // Not currently used
     image_border_width: u32,
-    // Другие параметры могут быть добавлены по мере реализации следующих шагов
+    // Other parameters can be added as implementation progresses
 }
 
 impl Default for Sift {
@@ -51,7 +51,7 @@ impl Default for Sift {
             num_octaves: DEFAULT_NUM_OCTAVES,
             num_intervals: DEFAULT_NUM_INTERVALS,
             assumed_blur: DEFAULT_ASSUMED_BLUR,
-            // Порог контрастности часто нормализуют на количество интервалов, как в vlfeat
+            // Contrast threshold is often normalized by number of intervals, like in vlfeat
             contrast_threshold: DEFAULT_CONTRAST_THRESHOLD / DEFAULT_NUM_INTERVALS as f32,
             edge_threshold: DEFAULT_EDGE_THRESHOLD,
             image_border_width: DEFAULT_IMAGE_BORDER_WIDTH,
@@ -79,16 +79,16 @@ impl Sift {
         }
     }
 
-    // Вспомогательная функция: изменение размера изображения
+    // Helper function: resize image
     fn resize_image(image: &GrayImage, new_width: u32, new_height: u32) -> GrayImage {
         let dyn_image = DynamicImage::ImageLuma8(image.clone());
-        // Lanczos3 хорошо подходит для уменьшения масштаба, сохраняя детали
+        // Lanczos3 is well suited for downscaling, preserving details
         let resized = dyn_image.resize_exact(new_width, new_height, FilterType::Lanczos3);
         resized.into_luma8()
     }
 
-    // Вспомогательная функция: преобразование GrayImage (Luma<u8>) в ImageBuffer<Luma<f32>, Vec<f32>>
-    // Значения пикселей нормализуются в диапазон [0.0, 1.0]
+    // Helper function: convert GrayImage (Luma<u8>) to ImageBuffer<Luma<f32>, Vec<f32>>
+    // Pixel values are normalized to range [0.0, 1.0]
     fn convert_u8_to_f32_gray(img: &GrayImage) -> ImageBuffer<Luma<f32>, Vec<f32>> {
         let (width, height) = img.dimensions();
         let mut f32_img = ImageBuffer::new(width, height);
@@ -100,7 +100,7 @@ impl Sift {
         f32_img
     }
 
-    // Вспомогательная функция: вычитание двух изображений Luma<f32> (параллельно)
+    // Helper function: subtract two Luma<f32> images (parallel)
     fn subtract_f32_images(
         img1: &ImageBuffer<Luma<f32>, Vec<f32>>,
         img2: &ImageBuffer<Luma<f32>, Vec<f32>>,
@@ -123,9 +123,9 @@ impl Sift {
         ImageBuffer::from_raw(width, height, result_pixels).expect("Failed to create result image")
     }
 
-    // Построение гауссовой пирамиды
-    // base_image: начальное изображение для пирамиды (после предварительной обработки)
-    // Возвращает: вектор октав, где каждая октава - это вектор размытых изображений GrayImage
+    // Build Gaussian Pyramid
+    // base_image: initial image for pyramid (after preprocessing)
+    // Returns: vector of octaves, where each octave is a vector of blurred GrayImages
     pub(crate) fn generate_gaussian_pyramid(&self, base_image: &GrayImage) -> Vec<Vec<GrayImage>> {
         let mut pyramid = Vec::with_capacity(self.num_octaves as usize);
         let mut current_octave_base_image = base_image.clone();
@@ -176,9 +176,9 @@ impl Sift {
         pyramid
     }
 
-    // Построение пирамиды разностей гауссианов (DoG) - параллельно по октавам
-    // gaussian_pyramid: результат generate_gaussian_pyramid
-    // Возвращает: вектор октав, где каждая октава - это вектор DoG изображений (Luma<f32>)
+    // Build Difference of Gaussians (DoG) pyramid - parallel over octaves
+    // gaussian_pyramid: result of generate_gaussian_pyramid
+    // Returns: vector of octaves, where each octave is a vector of DoG images (Luma<f32>)
     pub(crate) fn generate_dog_pyramid(
         &self,
         gaussian_pyramid: &[Vec<GrayImage>],
@@ -203,10 +203,10 @@ impl Sift {
             .collect()
     }
 
-    // Вспомогательная функция для получения значения пикселя (безопасная для границ)
+    // Helper function to get pixel value (boundary safe)
     #[inline(always)]
     pub(crate) fn get_pixel_value(img: &ImageBuffer<Luma<f32>, Vec<f32>>, x: i32, y: i32) -> f32 {
-        // Простая обработка границ - повторение крайнего пикселя
+        // Simple boundary handling - clamping to edge pixel
         let (width, height) = img.dimensions();
         let x_clamp = x.clamp(0, width as i32 - 1) as u32;
         let y_clamp = y.clamp(0, height as i32 - 1) as u32;
@@ -295,7 +295,7 @@ impl Sift {
             + q22 * dx * dy
     }
 
-    /// Уточняет положение экстремумов, отфильтровывает точки с низким контрастом и точки на краях.
+    /// Refines extrema positions, filters out low contrast points and edge points.
     pub(crate) fn refine_and_filter_extrema(
         &self,
         initial_keypoints: &[KeyPoint],
@@ -305,23 +305,23 @@ impl Sift {
 
         for kp in initial_keypoints {
             let octave_idx = kp.octave as usize;
-            let layer_idx = kp.layer as usize; // Индекс в DoG пирамиде
-            let x_int = kp.x / (2.0_f32.powi(kp.octave)); // Координаты в октаве
+            let layer_idx = kp.layer as usize; // Index in DoG pyramid
+            let x_int = kp.x / (2.0_f32.powi(kp.octave)); // Coordinates in octave
             let y_int = kp.y / (2.0_f32.powi(kp.octave));
-            let mut current_x = x_int as i32; // Используем i32 для вычислений разностей
+            let mut current_x = x_int as i32; // Use i32 for difference calculations
             let mut current_y = y_int as i32;
             let mut current_layer = layer_idx as i32;
 
             let dog_octave = &dog_pyramid[octave_idx];
 
-            // Итеративная интерполяция для уточнения положения
+            // Iterative interpolation to refine position
             let mut converged = false;
             let mut interpolated_kp_data = None;
 
             for _ in 0..MAX_INTERPOLATION_STEPS {
-                // Проверка, не вышли ли за границы слоев или изображения
+                // Check if we are within layer usage or image bounds
                 if current_layer < 1 || current_layer >= (dog_octave.len() - 1) as i32 {
-                    break; // Не можем вычислить производные по масштабу
+                    break; // Cannot compute scale derivatives
                 }
                 let img_prev = &dog_octave[current_layer as usize - 1];
                 let img_curr = &dog_octave[current_layer as usize];
@@ -332,10 +332,10 @@ impl Sift {
                     || current_y < 1
                     || current_y >= (height - 1) as i32
                 {
-                    break; // Не можем вычислить пространственные производные
+                    break; // Cannot compute spatial derivatives
                 }
 
-                // Вычисляем градиент (g) и Гессиан (H) с помощью центральных разностей
+                // Compute gradient (g) and Hessian (H) using central differences
                 let dx = (Self::get_pixel_value(img_curr, current_x + 1, current_y)
                     - Self::get_pixel_value(img_curr, current_x - 1, current_y))
                     / 2.0;
@@ -376,8 +376,8 @@ impl Sift {
 
                 let hessian = [[dxx, dxy, dxs], [dxy, dyy, dys], [dxs, dys, dss]];
 
-                // Решаем H * x_offset = -g для x_offset = [dx_hat, dy_hat, ds_hat]
-                // Используем формулу для инверсии 3x3 матрицы или решаем систему
+                // Solve H * x_offset = -g for x_offset = [dx_hat, dy_hat, ds_hat]
+                // Use formula for 3x3 matrix inversion or solve system
                 if let Some(offset) =
                     Self::solve_linear_system(hessian, [-gradient[0], -gradient[1], -gradient[2]])
                 {
@@ -385,32 +385,32 @@ impl Sift {
                     let dy_hat = offset[1];
                     let ds_hat = offset[2];
 
-                    // Если смещение по всем измерениям мало, считаем, что сошлись
+                    // If offset in all dimensions is small, consider converged
                     if dx_hat.abs() < INTERPOLATION_OFFSET_THRESHOLD
                         && dy_hat.abs() < INTERPOLATION_OFFSET_THRESHOLD
                         && ds_hat.abs() < INTERPOLATION_OFFSET_THRESHOLD
                     {
-                        // Вычисляем значение DoG в интерполированной точке
+                        // Compute DoG value at interpolated point
                         let interpolated_dog_val = center_val
                             + 0.5
                                 * (gradient[0] * dx_hat
                                     + gradient[1] * dy_hat
                                     + gradient[2] * ds_hat);
 
-                        // 1. Отбраковка по контрасту
+                        // 1. Contrast rejection
                         if interpolated_dog_val.abs() < self.contrast_threshold {
-                            break; // Отбрасываем точку
+                            break; // Discard point
                         }
 
-                        // 2. Отбраковка по краям (используем только 2x2 Гессиан по x, y)
+                        // 2. Edge rejection (use only 2x2 Hessian for x, y)
                         let hessian_xy = [[dxx, dxy], [dxy, dyy]];
                         let trace_sq = (hessian_xy[0][0] + hessian_xy[1][1]).powi(2);
                         let det = hessian_xy[0][0] * hessian_xy[1][1]
                             - hessian_xy[0][1] * hessian_xy[1][0];
 
                         if det <= 0.0 {
-                            // Определитель <= 0 означает разные знаки кривизн (седловая точка) или одна кривизна = 0
-                            break; // Отбрасываем точку
+                            // Determinant <= 0 means different curvature signs (saddle point) or one curvature = 0
+                            break; // Discard point
                         }
 
                         let edge_response_ratio = trace_sq / det;
@@ -418,16 +418,16 @@ impl Sift {
                             (self.edge_threshold + 1.0).powi(2) / self.edge_threshold;
 
                         if edge_response_ratio >= edge_threshold_sq {
-                            break; // Отбрасываем точку (слишком похожа на край)
+                            break; // Discard point (too edge-like)
                         }
 
-                        // Точка прошла все проверки! Сохраняем ее данные.
+                        // Point passed all checks! Saving data.
                         converged = true;
                         let scale_factor = 2.0_f32.powi(kp.octave);
                         let final_layer_float = current_layer as f32 + ds_hat;
-                        // Эффективная sigma = sigma_0 * 2^(octave + layer_float / num_intervals)
-                        // где sigma_0 = self.sigma
-                        // Размер точки обычно связывают с sigma гауссианы, на которой она найдена
+                        // Effective sigma = sigma_0 * 2^(octave + layer_float / num_intervals)
+                        // where sigma_0 = self.sigma
+                        // Point size is usually related to the Gaussian sigma where it was found
                         let point_sigma_absolute = self.sigma
                             * 2.0_f32.powf(
                                 kp.octave as f32 + final_layer_float / self.num_intervals as f32,
@@ -436,57 +436,57 @@ impl Sift {
                         interpolated_kp_data = Some(KeyPoint {
                             x: (current_x as f32 + dx_hat) * scale_factor,
                             y: (current_y as f32 + dy_hat) * scale_factor,
-                            // size: point_sigma_absolute * 2.0, // Размер часто удваивают для визуализации
-                            size: point_sigma_absolute, // Используем sigma как размер
-                            angle: 0.0,                 // Будет вычислена позже
+                            // size: point_sigma_absolute * 2.0, // Size is often doubled for visualization
+                            size: point_sigma_absolute, // Use sigma as size
+                            angle: 0.0,                 // To be computed later
                             response: interpolated_dog_val,
                             octave: kp.octave,
-                            layer: final_layer_float.round() as i32, // Сохраняем ближайший целый слой для информации
+                            layer: final_layer_float.round() as i32, // Store nearest integer layer for info
                         });
-                        break; // Успешная интерполяция
+                        break; // Successful interpolation
                     } else {
-                        // Смещение слишком большое, нужно перейти к новому ближайшему пикселю
-                        // и повторить интерполяцию (если не превысили лимит шагов)
-                        // Обновляем целочисленные координаты
+                        // Offset too large, need to move to new nearest pixel
+                        // and repeat interpolation (if step limit not exceeded)
+                        // Update integer coordinates
                         current_x = (current_x as f32 + dx_hat).round() as i32;
                         current_y = (current_y as f32 + dy_hat).round() as i32;
                         current_layer = (current_layer as f32 + ds_hat).round() as i32;
 
-                        // Проверка, не вышли ли мы за разумные границы слоя после смещения
+                        // Check if we exited reasonable layer bounds after offset
                         if current_layer < 0 || current_layer >= dog_octave.len() as i32 {
                             break;
                         }
                     }
                 } else {
-                    // Не удалось решить систему (Гессиан вырожден)
-                    break; // Отбрасываем точку
+                    // Failed to solve system (Hessian is singular)
+                    break; // Discard point
                 }
-            } // конец цикла интерполяции
+            } // end interpolation loop
 
             if converged {
                 if let Some(final_kp) = interpolated_kp_data {
                     refined_keypoints.push(final_kp);
                 }
             }
-        } // конец цикла по keypoints
+        } // end keypoints loop
 
         refined_keypoints
     }
 
-    // Вспомогательная функция для решения системы 3x3 Ax = b (Метод Крамера или Гаусса)
-    // Возвращает Option<[f32; 3]> ([x0, x1, x2])
+    // Helper function to solve 3x3 system Ax = b (Cramer's rule or Gauss)
+    // Returns Option<[f32; 3]> ([x0, x1, x2])
     fn solve_linear_system(a: [[f32; 3]; 3], b: [f32; 3]) -> Option<[f32; 3]> {
-        // Используем простой метод Крамера для 3x3
+        // Using simple Cramer's rule for 3x3
         let det_a = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
             - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
             + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
 
         if det_a.abs() < 1e-10 {
-            // Матрица вырождена или близка к вырожденной
+            // Matrix is singular or close to singular
             return None;
         }
 
-        // Вычисляем определители для Dx, Dy, Dz
+        // Compute determinants for Dx, Dy, Dz
         let det_x = b[0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
             - a[0][1] * (b[1] * a[2][2] - a[1][2] * b[2])
             + a[0][2] * (b[1] * a[2][1] - a[1][1] * b[2]);
@@ -502,11 +502,11 @@ impl Sift {
         Some([det_x / det_a, det_y / det_a, det_z / det_a])
     }
 
-    // Поиск экстремумов в масштабно-пространственной области (параллельно по октавам)
-    // dog_pyramid: результат generate_dog_pyramid
-    // Возвращает: вектор кандидатов в ключевые точки
-    /// Находит начальные кандидаты в ключевые точки (экстремумы DoG).
-    /// Возвращает `KeyPoint` с целочисленными координатами и слоем.
+    // Search for extrema in scale-space (parallel over octaves)
+    // dog_pyramid: result of generate_dog_pyramid
+    // Returns: vector of keypoint candidates
+    /// Finds initial keypoint candidates (DoG extrema).
+    /// Returns `KeyPoint` with integer coordinates and layer.
     pub(crate) fn find_scale_space_extrema(
         &self,
         dog_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
@@ -607,20 +607,20 @@ impl Sift {
         keypoints: &[KeyPoint],
         gaussian_pyramid: &[Vec<GrayImage>],
     ) -> Vec<KeyPoint> {
-        // Используем parallel iterator от Rayon
-        // collect() соберет результаты из разных потоков
-        // flat_map используется, т.к. одна входная точка может породить несколько выходных (с разными углами)
+        // Use parallel iterator from Rayon
+        // collect() will gather results from different threads
+        // flat_map is used because one input point can spawn multiple output points (with different angles)
         keypoints
-            .par_iter() // <--- Заменяем iter() на par_iter()
+            .par_iter() // <--- Replaces iter() with par_iter()
             .flat_map(|kp| {
-                let mut oriented_keypoints_for_this_kp = Vec::new(); // Локальный вектор для точки
+                let mut oriented_keypoints_for_this_kp = Vec::new(); // Local vector for the point
                 let octave_idx = kp.octave as usize;
                 let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
 
                 if octave_idx >= gaussian_pyramid.len()
                     || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
                 {
-                    return oriented_keypoints_for_this_kp; // Возвращаем пустой вектор, если индекс вне границ
+                    return oriented_keypoints_for_this_kp; // Return empty vector if index out of bounds
                 }
 
                 let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
@@ -642,7 +642,7 @@ impl Sift {
                 let weight_denom = 2.0 * weight_sigma * weight_sigma;
                 let mut hist = [0.0f32; ORIENTATION_HIST_BINS];
 
-                // --- Цикл построения гистограммы (остается последовательным внутри задачи) ---
+                // --- Histogram building loop (remains sequential within task) ---
                 for dy in -window_radius..=window_radius {
                     for dx in -window_radius..=window_radius {
                         let x_img = (x_octave + dx as f32).round() as i32;
@@ -669,11 +669,11 @@ impl Sift {
                         hist[bin_idx] += magnitude * weight;
                     }
                 }
-                // --- Конец цикла построения гистограммы ---
+                // --- End histogram building loop ---
 
-                // --- Сглаживание и поиск пиков (последовательно) ---
+                // --- Smoothing and peak finding (sequential) ---
                 let mut smoothed_hist = hist;
-                // ... (код сглаживания без изменений) ...
+                // ... (smoothing code unchanged) ...
                 for _ in 0..ORIENTATION_SMOOTHING_ITERATIONS {
                     let prev_hist = smoothed_hist;
                     for i in 0..ORIENTATION_HIST_BINS {
@@ -714,15 +714,15 @@ impl Sift {
                             };
                             let mut new_kp = kp.clone();
                             new_kp.angle = final_angle;
-                            oriented_keypoints_for_this_kp.push(new_kp); // Добавляем в локальный вектор
+                            oriented_keypoints_for_this_kp.push(new_kp); // Add to local vector
                         }
                     }
                 }
-                // --- Конец поиска пиков ---
+                // --- End peak finding ---
 
-                oriented_keypoints_for_this_kp // Возвращаем результат для этой точки
+                oriented_keypoints_for_this_kp // Return result for this point
             })
-            .collect() // Собираем результаты от всех потоков в один Vec<KeyPoint>
+            .collect() // Collect results from all threads into one Vec<KeyPoint>
     }
 
     #[allow(dead_code)]
@@ -842,7 +842,7 @@ impl Sift {
             .collect()
     }
 
-    /// Обнаруживает ключевые точки SIFT на изображении.
+    /// Detects SIFT keypoints in an image.
     pub fn detect(&self, img: &DynamicImage) -> Vec<KeyPoint> {
         // 1. Convert to grayscale
         let gray_img = img.to_luma8();
@@ -874,22 +874,22 @@ impl Sift {
         // println!("Found {} refined keypoints after filtering.", refined_keypoints.len());
 
         // 7. Assign orientations
-        // Передаем Гауссову пирамиду, т.к. градиенты считаются по ней
+        // Pass Gaussian pyramid since gradients are computed from it
         let oriented_keypoints = self.assign_orientations(&refined_keypoints, &gaussian_pyramid);
 
         println!(
             "Found {} final keypoints after orientation assignment.",
             oriented_keypoints.len()
-        ); // Отладка
+        ); // Debug
 
         oriented_keypoints
     }
 
-    /// Нормализует вектор и обрезает значения.
+    /// Normalizes and clips a descriptor vector.
     pub(crate) fn normalize_and_clip_descriptor(desc: &mut [f32]) {
         let norm = desc.iter().map(|&x| x * x).sum::<f32>().sqrt();
         if norm < 1e-8 {
-            // Избегаем деления на ноль
+            // Avoid division by zero
             return;
         }
 
@@ -897,11 +897,11 @@ impl Sift {
         let mut new_norm_sq = 0.0;
         for val in desc.iter_mut() {
             *val *= norm_inv;
-            *val = val.min(DESC_MAG_THR); // Обрезка
+            *val = val.min(DESC_MAG_THR); // Clipping
             new_norm_sq += *val * *val;
         }
 
-        // Вторая нормализация после обрезки
+        // Second normalization after clipping
         let new_norm = new_norm_sq.sqrt();
         if new_norm < 1e-8 {
             return;
@@ -912,8 +912,8 @@ impl Sift {
         }
     }
 
-    /// Вычисляет дескрипторы SIFT для заданных ключевых точек.
-    /// Использует Гауссову пирамиду для вычисления градиентов.
+    /// Computes SIFT descriptors for the given keypoints.
+    /// Uses Gaussian pyramid for gradient computation.
     pub fn compute(
         &self,
         gaussian_pyramid: &[Vec<GrayImage>],
@@ -921,21 +921,21 @@ impl Sift {
     ) -> Vec<Vec<f32>> {
         let desc_len = DESC_WINDOW_WIDTH * DESC_WINDOW_WIDTH * DESC_HIST_BINS;
 
-        // Используем parallel iterator от Rayon
-        // map() преобразует каждую точку в дескриптор
+        // Use parallel iterator from Rayon
+        // map() converts each keypoint to a descriptor
         keypoints
-            .par_iter() // <--- Заменяем iter() на par_iter()
+            .par_iter() // <--- Replaces iter() with par_iter()
             .map(|kp| {
-                let mut hist = vec![0.0f32; desc_len]; // Локальная гистограмма для точки
+                let mut hist = vec![0.0f32; desc_len]; // Local histogram for the point
                 let octave_idx = kp.octave as usize;
                 let gauss_layer_idx = (kp.layer).clamp(0, self.num_intervals as i32 + 2) as usize;
 
-                // Проверка границ (если вне - возвращаем нулевой дескриптор)
+                // Check bounds (return zero descriptor if out of bounds)
                 if octave_idx >= gaussian_pyramid.len()
                     || gauss_layer_idx >= gaussian_pyramid[octave_idx].len()
                 {
                     // eprintln!("Warning: Keypoint octave/layer index out of bounds during descriptor computation. KP: {:?}", kp);
-                    return hist; // Возвращаем нулевой вектор
+                    return hist; // Return zero vector
                 }
 
                 let gauss_image = &gaussian_pyramid[octave_idx][gauss_layer_idx];
@@ -947,7 +947,7 @@ impl Sift {
 
                 if sigma_octave <= 0.0 {
                     // eprintln!("Warning: Non-positive sigma_octave encountered ({}) during descriptor computation for KP: {:?}", sigma_octave, kp);
-                    return hist; // Возвращаем нулевой вектор
+                    return hist; // Return zero vector
                 }
 
                 let angle = kp.angle;
@@ -959,7 +959,7 @@ impl Sift {
                 let weight_denom = 2.0 * weight_sigma * weight_sigma;
                 let sample_radius = (window_width_pixels * 2.0f32.sqrt() * 0.5).ceil() as i32;
 
-                // --- Цикл построения гистограммы дескриптора (последовательный внутри задачи) ---
+                // --- Descriptor histogram building loop (sequential within task) ---
                 for dy_img in -sample_radius..=sample_radius {
                     for dx_img in -sample_radius..=sample_radius {
                         let px = dx_img as f32;
@@ -1042,7 +1042,7 @@ impl Sift {
                                                 * DESC_HIST_BINS as i32
                                                 + ia;
                                             hist[hist_index as usize] += contribution;
-                                            // Обновляем локальную hist
+                                            // Update local hist
                                         }
                                     }
                                 }
@@ -1050,16 +1050,16 @@ impl Sift {
                         }
                     }
                 }
-                // --- Конец цикла построения гистограммы ---
+                // --- End descriptor histogram building loop ---
 
-                // Нормализация локальной hist
+                // Normalize local hist
                 Self::normalize_and_clip_descriptor(&mut hist);
-                hist // Возвращаем готовый дескриптор для этой точки
+                hist // Return ready descriptor for this point
             })
-            .collect() // Собираем результаты от всех потоков в один Vec<Vec<f32>>
+            .collect() // Collect results from all threads into one Vec<Vec<f32>>
     }
 
-    /// Вычисляет дескрипторы SIFT, используя гауссову пирамиду в формате f32.
+    /// Computes SIFT descriptors using Gaussian pyramid in f32 format.
     pub fn compute_f32(
         &self,
         gaussian_pyramid: &[Vec<ImageBuffer<Luma<f32>, Vec<f32>>>],
@@ -1196,7 +1196,7 @@ impl Sift {
             .collect()
     }
 
-    /// CPU-путь SIFT: обнаружение и вычисление дескрипторов.
+    /// CPU path for SIFT: detection and descriptor computation.
     pub fn detect_and_compute_cpu(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
         // 1. Convert to grayscale
         let gray_img = img.to_luma8();
@@ -1239,8 +1239,8 @@ impl Sift {
         (oriented_keypoints, descriptors)
     }
 
-    /// Полный процесс SIFT с выбором бэкенда. Для обратной совместимости `detect_and_compute`
-    /// использует CPU, а эта функция дает возможность попробовать WebGPU с откатом.
+    /// Full SIFT process with backend selection. For backward compatibility, `detect_and_compute`
+    /// uses the CPU, while this function allows trying WebGPU with fallback.
     pub fn detect_and_compute_with_backend(
         &self,
         img: &DynamicImage,
@@ -1248,6 +1248,7 @@ impl Sift {
     ) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
         match backend {
             SiftBackend::Cpu => Ok(self.detect_and_compute_cpu(img)),
+            #[cfg(not(target_arch = "wasm32"))]
             SiftBackend::WebGpu => {
                 // Use GPU implementation
                 use crate::gpu_sift::{GpuSiftConfig, GpuSiftContext};
@@ -1291,6 +1292,55 @@ impl Sift {
 
                 Ok((keypoints, descriptors))
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            SiftBackend::WebGpuV2 => {
+                // Use GPU V2 implementation (full texture-based pipeline)
+                use crate::gpu_sift_v2::{GpuSiftConfigV2, GpuSiftV2};
+
+                let gray = img.to_luma8();
+                let (width, height) = gray.dimensions();
+                let pixels = gray.into_raw();
+
+                let config = GpuSiftConfigV2 {
+                    octaves: self.num_octaves,
+                    scales_per_octave: self.num_intervals,
+                    base_sigma: self.sigma,
+                    contrast_threshold: self.contrast_threshold,
+                    edge_threshold: self.edge_threshold,
+                    max_keypoints: 4096, // Default limit
+                };
+
+                // Run GPU V2 detection synchronously using tokio
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+                    rt.block_on(async {
+                        let mut ctx = GpuSiftV2::new(config)
+                            .await
+                            .map_err(|e| format!("GPU V2 init failed: {}", e))?;
+
+                        ctx.detect(&pixels, width, height)
+                            .await
+                            .map_err(|e| format!("GPU V2 detection failed: {}", e))
+                    })
+                })
+                .join()
+                .map_err(|_| "GPU V2 thread panicked".to_string())??;
+
+                // Convert [u8; 128] descriptors to Vec<f32>
+                let (keypoints, descriptors_u8) = result;
+                let descriptors: Vec<Vec<f32>> = descriptors_u8
+                    .into_iter()
+                    .map(|d| d.iter().map(|&v| v as f32 / 255.0).collect())
+                    .collect();
+
+                Ok((keypoints, descriptors))
+            }
+            #[cfg(target_arch = "wasm32")]
+            SiftBackend::WebGpu | SiftBackend::WebGpuV2 => {
+                Err("Sync GPU backend is not supported on WASM. Use async API.".to_string())
+            }
             SiftBackend::WebGpuWithCpuFallback => {
                 // Try GPU, fallback to CPU
                 match self.detect_and_compute_with_backend(img, SiftBackend::WebGpu) {
@@ -1304,7 +1354,7 @@ impl Sift {
         }
     }
 
-    /// Обратная совместимость: по умолчанию используем CPU путь.
+    /// Backward compatibility: use the CPU path by default.
     pub fn detect_and_compute(&self, img: &DynamicImage) -> (Vec<KeyPoint>, Vec<Vec<f32>>) {
         self.detect_and_compute_cpu(img)
     }
@@ -1337,7 +1387,7 @@ pub fn convert_f32_to_grayimage_normalized(
     let range = max_val - min_val;
 
     if range.abs() < 1e-6 {
-        // Если изображение почти плоское
+        // If image is almost flat
         let fill_val = if min_val > 0.0 {
             255
         } else if min_val < 0.0 {
@@ -1354,7 +1404,7 @@ pub fn convert_f32_to_grayimage_normalized(
         for y_coord in 0..height {
             for x_coord in 0..width {
                 let val_f32 = img_f32.get_pixel(x_coord, y_coord)[0];
-                let normalized_val = (val_f32 - min_val) / range; // Нормализация в [0, 1]
+                let normalized_val = (val_f32 - min_val) / range; // Normalize to [0, 1]
                 gray_img.put_pixel(
                     x_coord,
                     y_coord,
@@ -1389,12 +1439,12 @@ mod tests {
 
     #[test]
     fn test_solve_linear_system_singular() {
-        // Создаем сингулярную матрицу (например, две строки линейно зависимы)
+        // Create a singular matrix (e.g., two rows are linearly dependent)
         // 1x + 2y + 3z = 1
-        // 2x + 4y + 6z = 2  (вторая строка = 2 * первая)
+        // 2x + 4y + 6z = 2  (second row = 2 * first)
         // 0x + 1y + 1z = 3
         let a = [[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [0.0, 1.0, 1.0]];
-        let b = [1.0, 2.0, 3.0]; // b не имеет значения, важна матрица a
+        let b = [1.0, 2.0, 3.0]; // b does not matter, matrix a is important
 
         let result = Sift::solve_linear_system(a, b);
         assert!(
@@ -1405,55 +1455,55 @@ mod tests {
 
     #[test]
     fn test_get_gauss_pixel_bilinear() {
-        // Создаем простое изображение 3x3
+        // Create a simple 3x3 image
         // 10 20 30
         // 40 50 60
         // 70 80 90
-        // Значения нормализуются / 255.0
+        // Values are normalized / 255.0
         let img = GrayImage::from_raw(3, 3, vec![10, 20, 30, 40, 50, 60, 70, 80, 90]).unwrap();
 
         let val_at = |x, y| Sift::get_gauss_pixel_bilinear(&img, x, y);
         let pixel_val = |v| v as f32 / 255.0;
 
-        // 1. Точно в центре пикселя (1, 1) -> должно быть 50/255
+        // 1. Exactly at pixel center (1, 1) -> should be 50/255
         assert!(
             (val_at(1.0, 1.0) - pixel_val(50)).abs() < 1e-6,
             "Center pixel mismatch"
         );
 
-        // 2. Точно в угловом пикселе (0, 0) -> должно быть 10/255
+        // 2. Exactly at corner pixel (0, 0) -> should be 10/255
         assert!(
             (val_at(0.0, 0.0) - pixel_val(10)).abs() < 1e-6,
             "Corner pixel (0,0) mismatch"
         );
 
-        // 3. Точно в угловом пикселе (2, 2) -> должно быть 90/255
+        // 3. Exactly at corner pixel (2, 2) -> should be 90/255
         assert!(
             (val_at(2.0, 2.0) - pixel_val(90)).abs() < 1e-6,
             "Corner pixel (2,2) mismatch"
         );
 
-        // 4. Ровно посередине между (0,0) и (1,0) -> (10+20)/2 = 15
+        // 4. Exactly halfway between (0,0) and (1,0) -> (10+20)/2 = 15
         assert!(
             (val_at(0.5, 0.0) - pixel_val(15)).abs() < 1e-6,
             "Midpoint x=0.5, y=0 mismatch"
         );
 
-        // 5. Ровно посередине между (0,0) и (0,1) -> (10+40)/2 = 25
+        // 5. Exactly halfway between (0,0) and (0,1) -> (10+40)/2 = 25
         assert!(
             (val_at(0.0, 0.5) - pixel_val(25)).abs() < 1e-6,
             "Midpoint x=0, y=0.5 mismatch"
         );
 
-        // 6. Ровно в центре квадрата (0,0), (1,0), (0,1), (1,1) -> (10+20+40+50)/4 = 30
+        // 6. Exactly in the center of the square (0,0), (1,0), (0,1), (1,1) -> (10+20+40+50)/4 = 30
         assert!(
             (val_at(0.5, 0.5) - pixel_val(30)).abs() < 1e-6,
             "Center of square mismatch"
         );
 
-        // 7. За пределами изображения (должно использовать значение края)
-        // x=-0.5, y=0.5 -> должно интерполировать между q11=10, q21=20, q12=40, q22=50, но x0=-1, x1=0
-        // Использует get_gauss_pixel_value, который клонирует границу.
+        // 7. Outside image bounds (should use edge value)
+        // x=-0.5, y=0.5 -> should interpolate between q11=10, q21=20, q12=40, q22=50, but x0=-1, x1=0
+        // Uses get_gauss_pixel_value which clones boundary.
         // q11=val(-1,0)=10, q21=val(0,0)=10, q12=val(-1,1)=40, q22=val(0,1)=40
         // x=-0.5 -> x0=-1, dx=0.5. y=0.5 -> y0=0, dy=0.5
         // val = 10*(0.5)*(0.5) + 10*(0.5)*(0.5) + 40*(0.5)*(0.5) + 40*(0.5)*(0.5)
@@ -1463,7 +1513,7 @@ mod tests {
             "Outside boundary interpolation mismatch"
         );
 
-        // 8. Очень далеко за пределами (должно вернуть значение угла)
+        // 8. Very far outside (should return corner value)
         assert!(
             (val_at(-10.0, -10.0) - pixel_val(10)).abs() < 1e-6,
             "Far outside boundary mismatch (TL)"

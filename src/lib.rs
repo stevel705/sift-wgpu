@@ -1,23 +1,30 @@
 pub mod gpu_sift;
+pub mod gpu_sift_v2;
 pub mod keypoints;
 pub mod sift;
+pub mod utils;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 use std::str::FromStr;
 
-// Реэкспорт основных типов
+// Re-export main types
 pub use gpu_sift::{GpuSiftConfig, GpuSiftContext};
+pub use gpu_sift_v2::{GpuSiftConfigV2, GpuSiftV2};
 pub use keypoints::KeyPoint;
 pub use sift::{convert_f32_to_grayimage_normalized, load_image_dyn, save_gray_image, Sift};
 
-/// Выбор бэкенда для расчета SIFT.
+/// Backend selection for SIFT calculation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiftBackend {
-    /// Только CPU.
+    /// CPU only.
     Cpu,
-    /// Только WebGPU (ошибки пробрасываются наверх).
+    /// WebGPU only (errors are propagated up).
     WebGpu,
-    /// Сначала пробуем WebGPU, при ошибке тихо откатываемся на CPU.
+    /// Try WebGPU first, silently fallback to CPU on error.
     WebGpuWithCpuFallback,
+    /// Full GPU V2 pipeline (texture-based, targeting <20ms).
+    WebGpuV2,
 }
 
 impl Default for SiftBackend {
@@ -35,59 +42,60 @@ impl FromStr for SiftBackend {
             "cpu" => Ok(SiftBackend::Cpu),
             "webgpu" | "wgpu" | "gpu" => Ok(SiftBackend::WebGpu),
             "auto" | "fallback" | "prefer-gpu" => Ok(SiftBackend::WebGpuWithCpuFallback),
+            "gpuv2" | "gpu-v2" | "webgpu-v2" | "v2" => Ok(SiftBackend::WebGpuV2),
             _ => Err(format!("Unknown SIFT backend: {value}")),
         }
     }
 }
 
-// Оригинальные функции из твоего примера, если они все еще нужны снаружи
-use image::{open, DynamicImage, GrayImage, Rgb, RgbImage}; // Добавляем RgbImage, Rgb
-use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut}; // Добавляем функции рисования
+// Original functions from your example if they are still needed externally
+use image::{open, DynamicImage, GrayImage, Rgb, RgbImage}; // Add RgbImage, Rgb
+use imageproc::drawing::{draw_filled_circle_mut, draw_line_segment_mut}; // Add drawing functions
 
-/// Загружает изображение и преобразует его в оттенки серого.
+/// Loads an image and converts it to grayscale.
 pub fn load_and_convert_image(path: &str) -> GrayImage {
     let img = open(path).expect("Failed to open image");
     img.into_luma8()
 }
 
-/// Рисует ключевые точки на изображении.
+/// Draws keypoints on an image.
 ///
 /// # Arguments
-/// * `img` - Исходное изображение (`DynamicImage`).
-/// * `keypoints` - Срез ключевых точек для отрисовки.
-/// * `color` - Цвет для отрисовки точек (например, `Rgb([255u8, 0, 0])` для красного).
+/// * `img` - Source image (`DynamicImage`).
+/// * `keypoints` - Slice of keypoints to draw.
+/// * `color` - Color to draw points (e.g., `Rgb([255u8, 0, 0])` for red).
 ///
 /// # Returns
-/// * `RgbImage` - Новое изображение с нарисованными точками.
+/// * `RgbImage` - New image with drawn points.
 pub fn draw_keypoints_to_image(
     img: &DynamicImage,
     keypoints: &[KeyPoint],
     color: Rgb<u8>,
 ) -> RgbImage {
-    // Конвертируем в Rgb8 для возможности рисовать цветом
+    // Convert to Rgb8 to be able to draw in color
     let mut rgb_image = img.to_rgb8();
 
-    // Создаем цветной RGB-изображение для рисования
+    // Create colored RGB image for drawing
     for kp in keypoints {
         let x = kp.x;
         let y = kp.y;
-        let size: f32 = 2.0; //kp.size; // sigma точки
-        let angle = kp.angle; // ориентация в радианах
+        let size: f32 = 2.0; //kp.size; // sigma of the point
+        let angle = kp.angle; // orientation in radians
 
-        // Радиус круга пропорционален масштабу точки (sigma)
-        // Множитель 3.0 - эмпирический, чтобы круг был виден
+        // Circle radius is proportional to the point scale (sigma)
+        // Multiplier 3.0 is empirical to make the circle visible
         let radius = (size * 3.0).round() as i32;
-        // Минимальный радиус, чтобы очень маленькие точки были видны
+        // Minimum radius so very small points are visible
         let display_radius = radius.max(2);
 
-        // Рисуем круг
+        // Draw circle
         draw_filled_circle_mut(&mut rgb_image, (x as i32, y as i32), display_radius, color);
 
-        // Конечная точка для линии ориентации
+        // End point for orientation line
         let x_end = x + (display_radius as f32 * angle.cos());
         let y_end = y + (display_radius as f32 * angle.sin());
 
-        // Рисуем линию ориентации
+        // Draw orientation line
         draw_line_segment_mut(
             &mut rgb_image,
             (x, y),         // Начало в центре
