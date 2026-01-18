@@ -1,4 +1,5 @@
 pub mod gpu_sift;
+pub mod gpu_sift_v2;
 pub mod keypoints;
 pub mod sift;
 
@@ -6,6 +7,7 @@ use std::str::FromStr;
 
 // Реэкспорт основных типов
 pub use gpu_sift::{GpuSiftConfig, GpuSiftContext};
+pub use gpu_sift_v2::{GpuSiftConfigV2, GpuSiftV2};
 pub use keypoints::KeyPoint;
 pub use sift::{convert_f32_to_grayimage_normalized, load_image_dyn, save_gray_image, Sift};
 
@@ -18,6 +20,8 @@ pub enum SiftBackend {
     WebGpu,
     /// Сначала пробуем WebGPU, при ошибке тихо откатываемся на CPU.
     WebGpuWithCpuFallback,
+    /// Full GPU V2 pipeline (texture-based, targeting <20ms).
+    WebGpuV2,
 }
 
 impl Default for SiftBackend {
@@ -35,6 +39,7 @@ impl FromStr for SiftBackend {
             "cpu" => Ok(SiftBackend::Cpu),
             "webgpu" | "wgpu" | "gpu" => Ok(SiftBackend::WebGpu),
             "auto" | "fallback" | "prefer-gpu" => Ok(SiftBackend::WebGpuWithCpuFallback),
+            "gpuv2" | "gpu-v2" | "webgpu-v2" | "v2" => Ok(SiftBackend::WebGpuV2),
             _ => Err(format!("Unknown SIFT backend: {value}")),
         }
     }

@@ -20,11 +20,11 @@ fn print_usage() {
 
 fn parse_args() -> Result<(SiftBackend, String), String> {
     let args: Vec<String> = env::args().collect();
-    
+
     let mut backend: Option<SiftBackend> = None;
     let mut image_path: Option<String> = None;
     let mut i = 1;
-    
+
     while i < args.len() {
         if args[i] == "--backend" {
             if i + 1 >= args.len() {
@@ -42,7 +42,7 @@ fn parse_args() -> Result<(SiftBackend, String), String> {
             return Err(format!("Unknown argument: {}", args[i]));
         }
     }
-    
+
     // Fallback to environment variable if no CLI backend specified
     let backend = backend.unwrap_or_else(|| {
         env::var("SIFT_BACKEND")
@@ -50,9 +50,9 @@ fn parse_args() -> Result<(SiftBackend, String), String> {
             .and_then(|v| v.parse().ok())
             .unwrap_or_default()
     });
-    
+
     let image_path = image_path.ok_or_else(|| "No image path provided".to_string())?;
-    
+
     Ok((backend, image_path))
 }
 
@@ -116,7 +116,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !descriptors.is_empty() {
             println!("Example descriptor [0] length: {}", descriptors[0].len());
             // Можно вывести первые несколько значений дескриптора
-            // println!("Example descriptor [0] values (first 10): {:?}", &descriptors[0][..10.min(descriptors[0].len())]);
+            println!(
+                "Example descriptor [0] values (first 10): {:?}",
+                &descriptors[0][..10.min(descriptors[0].len())]
+            );
         }
 
         // --- Визуализация ---

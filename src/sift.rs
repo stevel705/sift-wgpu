@@ -1291,6 +1291,50 @@ impl Sift {
 
                 Ok((keypoints, descriptors))
             }
+            SiftBackend::WebGpuV2 => {
+                // Use GPU V2 implementation (full texture-based pipeline)
+                use crate::gpu_sift_v2::{GpuSiftConfigV2, GpuSiftV2};
+
+                let gray = img.to_luma8();
+                let (width, height) = gray.dimensions();
+                let pixels = gray.into_raw();
+
+                let config = GpuSiftConfigV2 {
+                    octaves: self.num_octaves,
+                    scales_per_octave: self.num_intervals,
+                    base_sigma: self.sigma,
+                    contrast_threshold: self.contrast_threshold,
+                    edge_threshold: self.edge_threshold,
+                    max_keypoints: 4096, // Default limit
+                };
+
+                // Run GPU V2 detection synchronously using tokio
+                let result = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new()
+                        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+                    rt.block_on(async {
+                        let mut ctx = GpuSiftV2::new(config)
+                            .await
+                            .map_err(|e| format!("GPU V2 init failed: {}", e))?;
+
+                        ctx.detect(&pixels, width, height)
+                            .await
+                            .map_err(|e| format!("GPU V2 detection failed: {}", e))
+                    })
+                })
+                .join()
+                .map_err(|_| "GPU V2 thread panicked".to_string())??;
+
+                // Convert [u8; 128] descriptors to Vec<f32>
+                let (keypoints, descriptors_u8) = result;
+                let descriptors: Vec<Vec<f32>> = descriptors_u8
+                    .into_iter()
+                    .map(|d| d.iter().map(|&v| v as f32 / 255.0).collect())
+                    .collect();
+
+                Ok((keypoints, descriptors))
+            }
             SiftBackend::WebGpuWithCpuFallback => {
                 // Try GPU, fallback to CPU
                 match self.detect_and_compute_with_backend(img, SiftBackend::WebGpu) {

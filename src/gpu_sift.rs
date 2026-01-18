@@ -21,7 +21,7 @@ impl Default for GpuSiftConfig {
             octaves: 4,
             scales: 5, // 5 scales → 4 DoG layers
             base_sigma: 1.6,
-            contrast_threshold: 0.03,
+            contrast_threshold: 0.04, // Match CPU default (0.04 / num_intervals)
             edge_threshold: 10.0,
         }
     }
@@ -162,10 +162,17 @@ impl GpuSiftContext {
         width: u32,
         height: u32,
     ) -> Result<(Vec<KeyPoint>, Vec<[u8; 128]>), Box<dyn std::error::Error>> {
+        let profile = std::env::var("SIFT_PROFILE").is_ok();
+        let total_start = std::time::Instant::now();
+
         // 1. Ensure buffers are sized correctly
+        let t0 = std::time::Instant::now();
         {
             let mut buffers = self.buffers.lock().unwrap();
             buffers.ensure_capacity(&self.device, width, height, &self.config);
+        }
+        if profile {
+            eprintln!("  [GPU] Buffer setup: {:?}", t0.elapsed());
         }
 
         // 2. Clone buffer handles (release lock before async)
@@ -187,17 +194,39 @@ impl GpuSiftContext {
         };
 
         // 3. Build DoG pyramid on CPU (hybrid approach for now)
+        let t1 = std::time::Instant::now();
         let gaussian_pyramid = self.build_pyramid_cpu(image, width, height);
+        if profile {
+            eprintln!("  [GPU] Gaussian pyramid (CPU): {:?}", t1.elapsed());
+        }
+
+        let t2 = std::time::Instant::now();
         let dog_pyramid = self.compute_dog_cpu(&gaussian_pyramid, width, height);
+        if profile {
+            eprintln!("  [GPU] DoG computation (CPU): {:?}", t2.elapsed());
+        }
 
         // 4. Upload DoG pyramid to GPU
+        let t3 = std::time::Instant::now();
         self.upload_dog_pyramid(&dog_pyramid, &run_ctx);
+        if profile {
+            eprintln!("  [GPU] Upload to GPU: {:?}", t3.elapsed());
+        }
 
         // 5. Execute GPU pipeline (extrema detection, orientation, descriptors)
+        let t4 = std::time::Instant::now();
         self.execute_pipeline(width, height, &run_ctx).await?;
+        if profile {
+            eprintln!("  [GPU] GPU pipeline: {:?}", t4.elapsed());
+        }
 
         // 6. Readback results
+        let t5 = std::time::Instant::now();
         let (keypoints, descriptors) = self.readback_results(&run_ctx).await?;
+        if profile {
+            eprintln!("  [GPU] Readback: {:?}", t5.elapsed());
+            eprintln!("  [GPU] Total: {:?}", total_start.elapsed());
+        }
 
         Ok((keypoints, descriptors))
     }
@@ -671,58 +700,100 @@ impl GpuSiftContext {
 
     /// Build Gaussian scale space on CPU and upload to GPU
     /// This is a hybrid approach: CPU builds pyramid, GPU does extrema detection
+    /// Uses INCREMENTAL blurring for efficiency (each scale from previous)
     fn build_pyramid_cpu(&self, image: &[u8], width: u32, height: u32) -> Vec<f32> {
         // k is the scale multiplier between adjacent scales
-        // Standard SIFT uses scales-3 intervals, but handle edge cases
+        // Standard SIFT uses scales-3 intervals
         let intervals = (self.config.scales as f32 - 3.0).max(1.0);
         let k = 2.0_f32.powf(1.0 / intervals);
+
+        // Precompute differential sigmas for incremental blurring
+        // sigma_total[s] = base_sigma * k^s
+        // sigma_diff[s] = sqrt(sigma_total[s]^2 - sigma_total[s-1]^2)
+        let mut diff_sigmas = vec![0.0f32; self.config.scales as usize];
+        let assumed_blur = 0.5f32; // assumed initial blur of input image
+
+        for s in 0..self.config.scales as usize {
+            if s == 0 {
+                // First scale: blur from assumed_blur to base_sigma
+                let sigma_target = self.config.base_sigma;
+                if sigma_target > assumed_blur {
+                    diff_sigmas[s] =
+                        (sigma_target * sigma_target - assumed_blur * assumed_blur).sqrt();
+                } else {
+                    diff_sigmas[s] = 0.0;
+                }
+            } else {
+                // Incremental blur from previous scale
+                let sigma_prev = self.config.base_sigma * k.powi((s - 1) as i32);
+                let sigma_curr = self.config.base_sigma * k.powi(s as i32);
+                diff_sigmas[s] = (sigma_curr * sigma_curr - sigma_prev * sigma_prev).sqrt();
+            }
+        }
 
         let mut pyramid_data = Vec::new();
         let mut current_img: Vec<f32> = image.iter().map(|&p| p as f32 / 255.0).collect();
         let mut w = width as usize;
         let mut h = height as usize;
 
-        for _octave in 0..self.config.octaves {
+        for octave in 0..self.config.octaves {
             if w < 8 || h < 8 {
                 break;
             }
 
-            // Build scales for this octave
-            for s in 0..self.config.scales {
-                let sigma = self.config.base_sigma * k.powi(s as i32);
+            // Build scales for this octave using incremental blur
+            let mut octave_images: Vec<Vec<f32>> = Vec::with_capacity(self.config.scales as usize);
 
-                // Apply Gaussian blur
-                let blurred = if s == 0 && _octave == 0 {
-                    current_img.clone() // First scale of first octave - use as is
-                } else if s == 0 {
-                    current_img.clone() // First scale of other octaves - already downsampled
+            for s in 0..self.config.scales as usize {
+                let blurred = if s == 0 {
+                    if octave == 0 && diff_sigmas[0] > 0.01 {
+                        // First octave, first scale: blur from input
+                        self.gaussian_blur_cpu(&current_img, w, h, diff_sigmas[0])
+                    } else {
+                        // Other octaves: first scale comes from downsampling (already at correct blur)
+                        current_img.clone()
+                    }
                 } else {
-                    self.gaussian_blur_cpu(&current_img, w, h, sigma)
+                    // Incremental blur from previous scale in this octave
+                    let prev_scale = &octave_images[s - 1];
+                    if diff_sigmas[s] > 0.01 {
+                        self.gaussian_blur_cpu(prev_scale, w, h, diff_sigmas[s])
+                    } else {
+                        prev_scale.clone()
+                    }
                 };
 
                 pyramid_data.extend_from_slice(&blurred);
-
-                if s == self.config.scales - 3 {
-                    // This is the scale we'll downsample from
-                    current_img = blurred;
-                }
+                octave_images.push(blurred);
             }
 
-            // Downsample for next octave
-            let new_w = w / 2;
-            let new_h = h / 2;
-            let mut downsampled = vec![0.0f32; new_w * new_h];
-            for y in 0..new_h {
-                for x in 0..new_w {
-                    downsampled[y * new_w + x] = current_img[(y * 2) * w + (x * 2)];
-                }
-            }
-            current_img = downsampled;
-            w = new_w;
-            h = new_h;
+            // Downsample from scale (scales-3) for next octave
+            // This is the scale with 2x the base blur
+            let downsample_idx = (self.config.scales as usize).saturating_sub(3);
+            current_img = self.downsample_2x(&octave_images[downsample_idx], w, h);
+            w /= 2;
+            h /= 2;
         }
 
         pyramid_data
+    }
+
+    /// Fast 2x downsample by taking every other pixel
+    fn downsample_2x(&self, img: &[f32], width: usize, height: usize) -> Vec<f32> {
+        let new_w = width / 2;
+        let new_h = height / 2;
+        let mut result = vec![0.0f32; new_w * new_h];
+
+        result
+            .par_chunks_mut(new_w)
+            .enumerate()
+            .for_each(|(y, row)| {
+                for x in 0..new_w {
+                    row[x] = img[(y * 2) * width + (x * 2)];
+                }
+            });
+
+        result
     }
 
     fn gaussian_blur_cpu(&self, img: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
@@ -731,22 +802,97 @@ impl GpuSiftContext {
             return img.to_vec();
         }
 
-        let radius = (sigma * 3.0).ceil() as i32;
+        // Use smaller radius (sigma * 2.5 is sufficient for SIFT, saves computation)
+        let radius = (sigma * 2.5).ceil() as i32;
         let size = (2 * radius + 1).max(1) as usize;
 
-        // Build kernel
+        // Build symmetric kernel (only store half + center)
         let mut kernel = vec![0.0f32; size];
         let mut sum = 0.0f32;
+        let two_sigma_sq = 2.0 * sigma * sigma;
         for i in 0..size {
             let x = (i as i32 - radius) as f32;
-            kernel[i] = (-x * x / (2.0 * sigma * sigma)).exp();
+            kernel[i] = (-x * x / two_sigma_sq).exp();
             sum += kernel[i];
         }
+        let norm = 1.0 / sum;
         for k in kernel.iter_mut() {
-            *k /= sum;
+            *k *= norm;
         }
 
+        // For small kernels, use simple approach
+        // For larger kernels, use optimized symmetric approach
+        if size <= 5 {
+            return self.gaussian_blur_simple(img, width, height, &kernel, radius);
+        }
+
+        // Optimized: exploit symmetry - kernel[i] == kernel[size-1-i]
         // Horizontal pass - parallel over rows
+        let mut temp = vec![0.0f32; width * height];
+        temp.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            let row_start = y * width;
+            for x in 0..width {
+                // Center weight
+                let mut val = img[row_start + x] * kernel[radius as usize];
+
+                // Symmetric pairs
+                for i in 1..=radius as usize {
+                    let left = if x >= i { x - i } else { 0 };
+                    let right = (x + i).min(width - 1);
+                    val += (img[row_start + left] + img[row_start + right])
+                        * kernel[radius as usize + i];
+                }
+                row[x] = val;
+            }
+        });
+
+        // Vertical pass - parallel over rows (better cache locality)
+        let mut result = vec![0.0f32; width * height];
+
+        // Process in chunks for better cache utilization
+        let chunk_height = 64.min(height);
+        result
+            .par_chunks_mut(chunk_height * width)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let y_start = chunk_idx * chunk_height;
+                let y_end = (y_start + chunk_height).min(height);
+
+                for local_y in 0..(y_end - y_start) {
+                    let y = y_start + local_y;
+                    let row_offset = local_y * width;
+
+                    for x in 0..width {
+                        // Center weight
+                        let mut val = temp[y * width + x] * kernel[radius as usize];
+
+                        // Symmetric pairs
+                        for i in 1..=radius as usize {
+                            let top = if y >= i { y - i } else { 0 };
+                            let bottom = (y + i).min(height - 1);
+                            val += (temp[top * width + x] + temp[bottom * width + x])
+                                * kernel[radius as usize + i];
+                        }
+                        chunk[row_offset + x] = val;
+                    }
+                }
+            });
+
+        result
+    }
+
+    /// Simple blur for small kernels (avoids overhead of symmetric optimization)
+    fn gaussian_blur_simple(
+        &self,
+        img: &[f32],
+        width: usize,
+        height: usize,
+        kernel: &[f32],
+        radius: i32,
+    ) -> Vec<f32> {
+        let size = kernel.len();
+
+        // Horizontal pass
         let mut temp = vec![0.0f32; width * height];
         temp.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
             for x in 0..width {
@@ -759,7 +905,7 @@ impl GpuSiftContext {
             }
         });
 
-        // Vertical pass - parallel over columns
+        // Vertical pass
         let mut result = vec![0.0f32; width * height];
         result
             .par_chunks_mut(width)
@@ -927,16 +1073,8 @@ impl GpuSiftContext {
         self.queue
             .write_buffer(&ctx.orientation_counter, 0, &[0u8; 4]);
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("SIFT Encoder"),
-            });
-
-        // DoG pyramid is already in heap (built on CPU and uploaded)
-
-        // ===== STAGE 1: Extrema Detection =====
-        // Create bind groups for extrema detection
+        // Create all bind groups upfront
+        // ===== Extrema Detection Bind Groups =====
         let extrema_bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Extrema BG0"),
             layout: &self.pipelines.extrema.get_bind_group_layout(0),
@@ -984,43 +1122,7 @@ impl GpuSiftContext {
             ],
         });
 
-        // Dispatch extrema detection
-        // The shader uses workgroup_id.z to determine (octave, dog_layer)
-        // For extrema detection we need 3 adjacent DoG layers, so we can detect
-        // extrema in (dog_scales - 2) middle layers
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Extrema Pass"),
-                timestamp_writes: None,
-            });
-
-            compute_pass.set_pipeline(&self.pipelines.extrema);
-            compute_pass.set_bind_group(0, &extrema_bg0, &[]);
-            compute_pass.set_bind_group(1, &extrema_bg1, &[]);
-            compute_pass.set_bind_group(2, &extrema_bg2, &[]);
-
-            // Calculate total z workgroups: octaves * (dog_scales - 2)
-            // -2 because we need 3 adjacent layers for extrema detection
-            let usable_dog_scales = dog_scales.saturating_sub(2).max(1);
-            let total_z = actual_octaves * usable_dog_scales;
-
-            let workgroups_x = (width + 15) / 16;
-            let workgroups_y = (height + 15) / 16;
-
-            compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, total_z);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-
-        // Submit and wait for extrema detection to complete
-        let _ = self.device.poll(wgpu::MaintainBase::Wait);
-        let mut encoder2 = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Orientation Encoder"),
-            });
-
-        // Create orientation bind groups
+        // ===== Orientation Bind Groups =====
         let orient_bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Orientation BG0"),
             layout: &self.pipelines.orientation.get_bind_group_layout(0),
@@ -1083,37 +1185,7 @@ impl GpuSiftContext {
             ],
         });
 
-        {
-            let mut compute_pass = encoder2.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Orientation Pass"),
-                timestamp_writes: None,
-            });
-
-            compute_pass.set_pipeline(&self.pipelines.orientation);
-            compute_pass.set_bind_group(0, &orient_bg0, &[]);
-            compute_pass.set_bind_group(1, &orient_bg1, &[]);
-            compute_pass.set_bind_group(2, &orient_bg2, &[]);
-            compute_pass.set_bind_group(3, &orient_bg3, &[]);
-
-            // Dispatch orientation computation
-            // Each keypoint needs 36 threads (one per histogram bin)
-            // For simplicity, dispatch fixed workgroups (will be bounded by shader)
-            let max_keypoints = 1024; // Conservative estimate
-            let workgroups = (max_keypoints * 36 + 35) / 36;
-            compute_pass.dispatch_workgroups(workgroups, 1, 1);
-        }
-
-        self.queue.submit(Some(encoder2.finish()));
-        let _ = self.device.poll(wgpu::MaintainBase::Wait);
-
-        // Stage 3: Descriptor computation
-        let mut encoder3 = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Descriptor Encoder"),
-            });
-
-        // Create descriptor bind groups
+        // ===== Descriptor Bind Groups =====
         let desc_bg0 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Descriptor BG0"),
             layout: &self.pipelines.descriptor.get_bind_group_layout(0),
@@ -1170,8 +1242,59 @@ impl GpuSiftContext {
             }],
         });
 
+        // ===== SINGLE ENCODER - All stages in one command buffer =====
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("SIFT Full Pipeline Encoder"),
+            });
+
+        // ===== STAGE 1: Extrema Detection =====
         {
-            let mut compute_pass = encoder3.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Extrema Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.pipelines.extrema);
+            compute_pass.set_bind_group(0, &extrema_bg0, &[]);
+            compute_pass.set_bind_group(1, &extrema_bg1, &[]);
+            compute_pass.set_bind_group(2, &extrema_bg2, &[]);
+
+            // Calculate total z workgroups: octaves * (dog_scales - 2)
+            let usable_dog_scales = dog_scales.saturating_sub(2).max(1);
+            let total_z = actual_octaves * usable_dog_scales;
+
+            let workgroups_x = (width + 15) / 16;
+            let workgroups_y = (height + 15) / 16;
+
+            compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, total_z);
+        }
+        // Pass ends here - implicit barrier between compute passes
+
+        // ===== STAGE 2: Orientation Assignment =====
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Orientation Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.pipelines.orientation);
+            compute_pass.set_bind_group(0, &orient_bg0, &[]);
+            compute_pass.set_bind_group(1, &orient_bg1, &[]);
+            compute_pass.set_bind_group(2, &orient_bg2, &[]);
+            compute_pass.set_bind_group(3, &orient_bg3, &[]);
+
+            // Dispatch orientation computation
+            let max_keypoints = 1024;
+            let workgroups = (max_keypoints * 36 + 35) / 36;
+            compute_pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+        // Pass ends here - implicit barrier
+
+        // ===== STAGE 3: Descriptor Computation =====
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Descriptor Pass"),
                 timestamp_writes: None,
             });
@@ -1188,9 +1311,10 @@ impl GpuSiftContext {
             compute_pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        self.queue.submit(Some(encoder3.finish()));
+        // SINGLE SUBMIT - all stages in one command buffer
+        self.queue.submit(Some(encoder.finish()));
 
-        // Wait for all GPU work to complete
+        // Wait for all GPU work to complete (only ONE wait)
         let _ = self.device.poll(wgpu::MaintainBase::Wait);
 
         Ok(())
