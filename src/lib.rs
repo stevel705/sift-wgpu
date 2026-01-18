@@ -2,6 +2,9 @@ pub mod gpu_sift;
 pub mod gpu_sift_v2;
 pub mod keypoints;
 pub mod sift;
+pub mod utils;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 use std::str::FromStr;
 

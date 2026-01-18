@@ -18,24 +18,49 @@ homepage = "https://github.com/stevel705/sift-rs"
 [lib]
 name = "sift"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "sift"
 path = "src/main.rs"
 
 [dependencies]
-image = "0.25.6"
+image = { version = "0.25.6", default-features = false, features = [
+    "png",
+    "jpeg",
+    "bmp",
+] }
 ndarray = "0.16.1"
-imageproc = "0.25.0"
+imageproc = { version = "0.25.0", default-features = false }
+wgpu = { version = "25.0.0", features = [
+    "webgl",
+] } # Enable webgl mostly for compat/testing if needed, but webgpu is main target. Actually just default is fine.
+pollster = "0.4.0"
+bytemuck = { version = "1.23.0", features = ["derive"] }
+log = "0.4.27"
+env_logger = "0.11.8"
+futures-intrusive = "0.5"
+half = "2.4"
+web-time = "1.1"
+futures = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rayon = "1.10.0"
-wgpu = "25.0.0" # Основной крейт wgpu
-pollster = "0.4.0" # Для блокирующего выполнения async wgpu кода (просто для начала)
-bytemuck = { version = "1.23.0", features = ["derive"] } # Для безопасного кастинга данных в байты
-log = "0.4.27" # wgpu использует логгирование
-env_logger = "0.11.8" # Простой логгер для примера
-futures-intrusive = "0.5" # Для использования futures в wgpu
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] } # Для GPU backend runtime
-half = "2.4" # Для f16 конвертации в GPU пайплайне
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+console_log = "1.0"
+# getrandom is pulled by other deps, need to enable js feature
+getrandom = { version = "0.2", features = ["js"] }
+web-sys = { version = "0.3", features = [
+    "console",
+    "Window",
+    "Navigator",
+    "Performance",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] } # Additional features for tests

@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust SIFT WebGPU Demo</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f0f2f5;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            max-width: 800px;
+            width: 100%;
+        }
+
+        h1 {
+            margin-top: 0;
+            color: #333;
+        }
+
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        button {
+            background-color: #0070f3;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        button:hover {
+            background-color: #0051a2;
+        }
+
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+
+        select {
+            padding: 8px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+        }
+
+        .canvas-wrapper {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            background: #000;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 0 auto;
+        }
+
+        video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        .stats {
+            margin-top: 10px;
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            font-family: monospace;
+            background: #eee;
+            padding: 10px;
+            border-radius: 4px;
+        }
+
+        .stat-item span {
+            font-weight: bold;
+            color: #0070f3;
+        }
+
+        #error-msg {
+            color: red;
+            margin-top: 10px;
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>SIFT-rs WebGPU Demo</h1>
+
+        <div class="controls">
+            <button id="start-btn">Start Camera</button>
+            <select id="backend-select">
+                <option value="gpu">WebGPU (Async)</option>
+                <option value="cpu">CPU (Sync)</option>
+            </select>
+            <select id="resolution-select">
+                <option value="320">320px</option>
+                <option value="640">640px</option>
+                <option value="1280">1280px</option>
+            </select>
+            <label>
+                <input type="checkbox" id="draw-video" checked> Show Video
+            </label>
+            <span id="status">Loading WASM...</span>
+        </div>
+
+        <div class="canvas-wrapper">
+            <video id="video" playsinline></video>
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div id="error-msg"></div>
+
+        <div class="stats">
+            <div class="stat-item">FPS: <span id="fps">0</span></div>
+            <div class="stat-item">Processing Time: <span id="time">0</span> ms</div>
+            <div class="stat-item">Keypoints: <span id="kps">0</span></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import init, { init_logging, detect_sift_cpu, SiftDetector } from './pkg/sift.js';
+
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const startBtn = document.getElementById('start-btn');
+        const backendSelect = document.getElementById('backend-select');
+        const statusSpan = document.getElementById('status');
+        const errorMsg = document.getElementById('error-msg');
+        const fpsSpan = document.getElementById('fps');
+        const timeSpan = document.getElementById('time');
+        const kpsSpan = document.getElementById('kps');
+
+        let isRunning = false;
+        let animationId;
+        let lastFrameTime = 0;
+        let frameCount = 0;
+        let lastFpsTime = 0;
+
+        let gpuDetector = null; // Persistent instance
+
+        // Setup scaling
+        let processWidth = 320; // Lower resolution for performance
+        let processHeight = 240;
+        let scaleX = 1;
+        let scaleY = 1;
+
+        const resolutionSelect = document.getElementById('resolution-select');
+        resolutionSelect.onchange = () => {
+            processWidth = parseInt(resolutionSelect.value);
+            if (video.videoWidth > 0 && video.videoHeight > 0) {
+                const aspect = video.videoWidth / video.videoHeight;
+                processHeight = Math.round(processWidth / aspect);
+                scaleX = canvas.width / processWidth;
+                scaleY = canvas.height / processHeight;
+            }
+        };
+
+        async function main() {
+            try {
+                await init();
+                init_logging();
+                statusSpan.textContent = 'Ready';
+                startBtn.onclick = toggleCamera;
+            } catch (e) {
+                showError(`Failed to load WASM: ${e}`);
+            }
+        }
+
+        function showError(msg) {
+            errorMsg.textContent = msg;
+            errorMsg.style.display = 'block';
+            console.error(msg);
+        }
+
+        async function toggleCamera() {
+            if (isRunning) {
+                stopCamera();
+            } else {
+                await startCamera();
+            }
+        }
+
+        async function startCamera() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showError("Camera API not available. This usually means you are not using HTTPS or Localhost.");
+                return;
+            }
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: 'environment'
+                    }
+                });
+                video.srcObject = stream;
+                await video.play();
+
+                processHeight = Math.round(processWidth * (video.videoHeight / video.videoWidth));
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                scaleX = video.videoWidth / processWidth;
+                scaleY = video.videoHeight / processHeight;
+
+                isRunning = true;
+                startBtn.textContent = 'Stop Camera';
+                errorMsg.style.display = 'none';
+
+                requestAnimationFrame(processFrame);
+            } catch (e) {
+                showError(`Camera error: ${e.message}`);
+            }
+        }
+
+        function stopCamera() {
+            isRunning = false;
+            cancelAnimationFrame(animationId);
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+            startBtn.textContent = 'Start Camera';
+
+            // Clear stats
+            fpsSpan.textContent = '0';
+            timeSpan.textContent = '0';
+            kpsSpan.textContent = '0';
+        }
+
+        // Temporary canvas for resizing
+        const tempCanvas = document.createElement('canvas');
+        const tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+
+        async function processFrame(timestamp) {
+            if (!isRunning) return;
+
+            // Calculate FPS
+            if (timestamp - lastFpsTime >= 1000) {
+                fpsSpan.textContent = frameCount;
+                frameCount = 0;
+                lastFpsTime = timestamp;
+            }
+            frameCount++;
+
+            // Resize frame for processing
+            if (tempCanvas.width !== processWidth || tempCanvas.height !== processHeight) {
+                tempCanvas.width = processWidth;
+                tempCanvas.height = processHeight;
+            }
+
+            tempCtx.drawImage(video, 0, 0, processWidth, processHeight);
+            const imageData = tempCtx.getImageData(0, 0, processWidth, processHeight);
+
+            const backend = backendSelect.value;
+            const startTime = performance.now();
+
+            let result;
+            try {
+                if (backend === 'gpu') {
+                    if (!gpuDetector) {
+                        // Init once
+                        console.log("Initializing GPU SIFT...");
+                        gpuDetector = await SiftDetector.new();
+                    }
+                    result = await gpuDetector.detect(imageData.data, processWidth, processHeight);
+                } else {
+                    // CPU is sync, might block UI
+                    result = detect_sift_cpu(imageData.data, processWidth, processHeight);
+                }
+
+                const processTime = performance.now() - startTime;
+                timeSpan.textContent = processTime.toFixed(1);
+
+                // Draw results
+                if (document.getElementById('draw-video').checked) {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    // Video is already behind canvas
+                } else {
+                    ctx.fillStyle = 'black';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                }
+
+                drawKeypoints(result);
+                kpsSpan.textContent = result.keypoint_count();
+
+                // Free memory if necessary (Rust helper might handle it automatically, 
+                // but if result is a large object, let garbage collector know)
+                result.free();
+
+            } catch (e) {
+                console.error("Processing error:", e);
+                // Don't spam errors
+                // isRunning = false; 
+            }
+
+            animationId = requestAnimationFrame(processFrame);
+        }
+
+        function drawKeypoints(result) {
+            const count = result.keypoint_count();
+            const flatKps = result.get_keypoints_flat();
+            // [x, y, size, angle, octave, layer, ...] - 6 floats per point
+
+            ctx.lineWidth = 1;
+
+            for (let i = 0; i < count; i++) {
+                const base = i * 6;
+                const x = flatKps[base] * scaleX;
+                const y = flatKps[base + 1] * scaleY;
+                const size = flatKps[base + 2] * scaleX; // Scale size too
+                const angle = flatKps[base + 3];
+
+                // Draw circle representing blob size
+                ctx.beginPath();
+                ctx.arc(x, y, size, 0, 2 * Math.PI);
+                ctx.strokeStyle = '#00ff00'; // Green
+                ctx.stroke();
+
+                // Draw orientation line
+                ctx.beginPath();
+                ctx.moveTo(x, y);
+                ctx.lineTo(x + Math.cos(angle) * size, y + Math.sin(angle) * size);
+                ctx.strokeStyle = '#ff0000'; // Red
+                ctx.stroke();
+            }
+        }
+
+        main();
+    </script>
+</body>
+
+</html>

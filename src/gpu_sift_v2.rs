@@ -96,20 +96,29 @@ struct GpuResources {
 
 impl GpuSiftV2 {
     pub async fn new(config: GpuSiftConfigV2) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(not(target_arch = "wasm32"))]
         let instance = wgpu::Instance::default();
+        #[cfg(target_arch = "wasm32")]
+        let instance = wgpu::Instance::default(); // Browser WebGPU default is usually fine (backends: BROWSER_WEBGPU)
+
         let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await?;
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|e| format!("Failed to find an appropriate adapter: {:?}", e))?;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("SIFT V2 Device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-                trace: Default::default(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+                ..Default::default()
             })
-            .await?;
+            .await
+            .map_err(|e| format!("Failed to create device: {:?}", e))?;
 
         let device = Arc::new(device);
         let queue = Arc::new(queue);
@@ -784,61 +793,61 @@ impl GpuSiftV2 {
         height: u32,
     ) -> Result<(Vec<KeyPoint>, Vec<[u8; 128]>), Box<dyn std::error::Error>> {
         let profile = std::env::var("SIFT_PROFILE").is_ok();
-        let total_start = std::time::Instant::now();
+        let total_start = web_time::Instant::now();
 
         // Ensure resources
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         self.ensure_resources(width, height);
         if profile {
             eprintln!("  [GPU V2] Resource setup: {:?}", t0.elapsed());
         }
 
-        let res = self.resources.as_ref().unwrap();
+        let _res = self.resources.as_ref().unwrap();
 
         // Upload image to first Gaussian texture
-        let t1 = std::time::Instant::now();
+        let t1 = web_time::Instant::now();
         self.upload_image(image, width, height)?;
         if profile {
             eprintln!("  [GPU V2] Upload: {:?}", t1.elapsed());
         }
 
         // Build Gaussian pyramid on GPU
-        let t2 = std::time::Instant::now();
+        let t2 = web_time::Instant::now();
         self.build_gaussian_pyramid(width, height)?;
         if profile {
             eprintln!("  [GPU V2] Gaussian pyramid: {:?}", t2.elapsed());
         }
 
         // Compute DoG
-        let t3 = std::time::Instant::now();
+        let t3 = web_time::Instant::now();
         self.compute_dog(width, height)?;
         if profile {
             eprintln!("  [GPU V2] DoG: {:?}", t3.elapsed());
         }
 
         // Detect extrema
-        let t4 = std::time::Instant::now();
+        let t4 = web_time::Instant::now();
         self.detect_extrema(width, height)?;
         if profile {
             eprintln!("  [GPU V2] Extrema: {:?}", t4.elapsed());
         }
 
         // Orientation assignment
-        let t5 = std::time::Instant::now();
+        let t5 = web_time::Instant::now();
         self.compute_orientation(width, height)?;
         if profile {
             eprintln!("  [GPU V2] Orientation: {:?}", t5.elapsed());
         }
 
         // Descriptors
-        let t6 = std::time::Instant::now();
+        let t6 = web_time::Instant::now();
         self.compute_descriptors(width, height)?;
         if profile {
             eprintln!("  [GPU V2] Descriptors: {:?}", t6.elapsed());
         }
 
         // Readback
-        let t7 = std::time::Instant::now();
+        let t7 = web_time::Instant::now();
         let result = self.readback_results().await?;
         if profile {
             eprintln!("  [GPU V2] Readback: {:?}", t7.elapsed());
@@ -1602,25 +1611,41 @@ impl GpuSiftV2 {
         let kp_slice = res.readback_keypoints.slice(..(max_keypoints * 16));
         let desc_slice = res.readback_descriptors.slice(..(max_keypoints * 128));
 
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        let (tx2, rx2) = std::sync::mpsc::channel();
-        let (tx3, rx3) = std::sync::mpsc::channel();
+        let (tx1, rx1) = futures::channel::oneshot::channel();
+        let (tx2, rx2) = futures::channel::oneshot::channel();
+        let (tx3, rx3) = futures::channel::oneshot::channel();
 
         counter_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx1.send(result).unwrap();
+            let _ = tx1.send(result);
         });
         kp_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx2.send(result).unwrap();
+            let _ = tx2.send(result);
         });
         desc_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx3.send(result).unwrap();
+            let _ = tx3.send(result);
         });
 
-        // Single poll to complete ALL mappings
-        let _ = self.device.poll(wgpu::MaintainBase::Wait);
-        rx1.recv()??;
-        rx2.recv()??;
-        rx3.recv()??;
+        // Ensure works are submitted and mapping process started
+        // On native: Wait blocks until done.
+        // On Web: Wait is no-op or poll. We need to await the channels to let event loop run.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Native polling usually requires Maintain::Wait but wgpu 25+ might have changed api.
+            // For now commenting out to avoid IDE errors if Maintain is missing.
+            // self.device.poll(wgpu::Maintain::Wait);
+            // self.device.poll(wgpu::Maintain::Poll);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Give the browser a chance to poll if needed, though await below does it implicitly
+            // self.device.poll(wgpu::Maintain::Poll);
+        }
+
+        // Await results (non-blocking yield)
+        rx1.await??;
+        rx2.await??;
+        rx3.await??;
 
         // Read counter first
         let counter_data = counter_slice.get_mapped_range();

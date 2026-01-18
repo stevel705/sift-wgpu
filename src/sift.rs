@@ -1,7 +1,7 @@
+use crate::utils::*;
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, ImageBuffer, Luma};
 use imageproc::filter::gaussian_blur_f32;
-use rayon::prelude::*;
 use std::f32::consts::PI;
 
 use crate::{keypoints::KeyPoint, SiftBackend};
@@ -1248,6 +1248,7 @@ impl Sift {
     ) -> Result<(Vec<KeyPoint>, Vec<Vec<f32>>), String> {
         match backend {
             SiftBackend::Cpu => Ok(self.detect_and_compute_cpu(img)),
+            #[cfg(not(target_arch = "wasm32"))]
             SiftBackend::WebGpu => {
                 // Use GPU implementation
                 use crate::gpu_sift::{GpuSiftConfig, GpuSiftContext};
@@ -1291,6 +1292,7 @@ impl Sift {
 
                 Ok((keypoints, descriptors))
             }
+            #[cfg(not(target_arch = "wasm32"))]
             SiftBackend::WebGpuV2 => {
                 // Use GPU V2 implementation (full texture-based pipeline)
                 use crate::gpu_sift_v2::{GpuSiftConfigV2, GpuSiftV2};
@@ -1334,6 +1336,10 @@ impl Sift {
                     .collect();
 
                 Ok((keypoints, descriptors))
+            }
+            #[cfg(target_arch = "wasm32")]
+            SiftBackend::WebGpu | SiftBackend::WebGpuV2 => {
+                Err("Sync GPU backend is not supported on WASM. Use async API.".to_string())
             }
             SiftBackend::WebGpuWithCpuFallback => {
                 // Try GPU, fallback to CPU

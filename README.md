@@ -104,6 +104,86 @@ cargo build --release
 SIFT_BACKEND=gpuv2 ./target/release/sift data/lenna.png
 ```
 
+## Web / WASM Support
+
+The library supports compilation to WebAssembly (WASM) for use in browsers. It includes both a CPU backend (single-threaded) and a WebGPU backend.
+
+### Prerequisites
+
+- Rust toolchain
+- [`wasm-pack`](https://rustwasm.github.io/wasm-pack/installer.html)
+
+### Building for Web
+
+```sh
+# optional: --out-dir to specify output folder
+wasm-pack build --target web --release --out-dir www/pkg 
+```
+
+### Running the Web Demo
+
+The repository includes a webcam demo in the `www` folder.
+
+1. Build the WASM package:
+   ```sh
+   wasm-pack build --target web --release
+   ```
+
+2. Link the package to the web folder:
+   ```sh
+   cd www
+   ln -s ../pkg pkg
+   ```
+   *(Or manually copy the `pkg` folder into `www` if you are on Windows)*
+
+3. Serve the `www` folder with a local server (HTTPS or localhost required for Camera API):
+   ```sh
+   # Python
+   python3 -m http.server 8000
+   
+   # Node
+   npx serve .
+   ```
+
+4. Open `http://localhost:8000` in a browser with WebGPU support (Chrome 113+, Edge).
+   - If using `localhost`, Camera API works.
+   - If using a network IP (e.g. on mobile), you **must** use HTTPS (e.g. via `ngrok`) or the camera will fail.
+
+### Web API Usage
+
+```javascript
+import init, { SiftDetector, detect_sift_cpu } from './pkg/sift.js';
+
+async function run() {
+    await init();
+
+    // 1. GPU Backend (Async, Persistent)
+    // Initialize once (compiles shaders, allocates resources)
+    const detector = await SiftDetector.new();
+    
+    // Detect frame (RGBA or Grayscale buffer)
+    // detector returns { keypoints: [...], descriptors: Float32Array }
+    const result = await detector.detect(imageData.data, width, height);
+    
+    console.log(`Found ${result.keypoint_count()} keypoints`);
+    
+    // Access result data
+    const kps = result.get_keypoint(0); // { x, y, size, angle, octave, layer }
+    const descriptors = result.get_descriptors(); 
+    
+    
+    // 2. CPU Backend (Sync)
+    const resultCpu = detect_sift_cpu(imageData.data, width, height);
+}
+
+run();
+```
+
+## Performance Note
+
+- **CPU**: Uses optimized SIMD (via `wasm-opt`) but is single-threaded in the browser. Fast for 320p/480p, slower for HD.
+- **WebGPU**: High initialization cost but scales well with resolution (720p+). Requires optimized texture pipeline (V2) which is the default in the web binding.
+
 ### CLI Options
 
 ```
@@ -170,9 +250,10 @@ src/
 - [x] Add tests
 - [x] Add examples
 - [x] Add WebGPU support (V1 & V2)
+- [x] Add WASM support
+- [x] Add Web Demo with Camera
 - [ ] Add documentation
 - [ ] Add benchmarks
-- [ ] Add WASM support
 
 ## License
 

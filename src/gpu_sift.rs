@@ -2,7 +2,7 @@
 // WebGPU-based SIFT implementation
 
 use crate::keypoints::KeyPoint;
-use rayon::prelude::*;
+use crate::utils::*;
 use std::sync::{Arc, Mutex};
 use wgpu;
 
@@ -163,10 +163,10 @@ impl GpuSiftContext {
         height: u32,
     ) -> Result<(Vec<KeyPoint>, Vec<[u8; 128]>), Box<dyn std::error::Error>> {
         let profile = std::env::var("SIFT_PROFILE").is_ok();
-        let total_start = std::time::Instant::now();
+        let total_start = web_time::Instant::now();
 
         // 1. Ensure buffers are sized correctly
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         {
             let mut buffers = self.buffers.lock().unwrap();
             buffers.ensure_capacity(&self.device, width, height, &self.config);
@@ -194,34 +194,34 @@ impl GpuSiftContext {
         };
 
         // 3. Build DoG pyramid on CPU (hybrid approach for now)
-        let t1 = std::time::Instant::now();
+        let t1 = web_time::Instant::now();
         let gaussian_pyramid = self.build_pyramid_cpu(image, width, height);
         if profile {
             eprintln!("  [GPU] Gaussian pyramid (CPU): {:?}", t1.elapsed());
         }
 
-        let t2 = std::time::Instant::now();
+        let t2 = web_time::Instant::now();
         let dog_pyramid = self.compute_dog_cpu(&gaussian_pyramid, width, height);
         if profile {
             eprintln!("  [GPU] DoG computation (CPU): {:?}", t2.elapsed());
         }
 
         // 4. Upload DoG pyramid to GPU
-        let t3 = std::time::Instant::now();
+        let t3 = web_time::Instant::now();
         self.upload_dog_pyramid(&dog_pyramid, &run_ctx);
         if profile {
             eprintln!("  [GPU] Upload to GPU: {:?}", t3.elapsed());
         }
 
         // 5. Execute GPU pipeline (extrema detection, orientation, descriptors)
-        let t4 = std::time::Instant::now();
+        let t4 = web_time::Instant::now();
         self.execute_pipeline(width, height, &run_ctx).await?;
         if profile {
             eprintln!("  [GPU] GPU pipeline: {:?}", t4.elapsed());
         }
 
         // 6. Readback results
-        let t5 = std::time::Instant::now();
+        let t5 = web_time::Instant::now();
         let (keypoints, descriptors) = self.readback_results(&run_ctx).await?;
         if profile {
             eprintln!("  [GPU] Readback: {:?}", t5.elapsed());
@@ -856,7 +856,7 @@ impl GpuSiftContext {
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 let y_start = chunk_idx * chunk_height;
-                let y_end = (y_start + chunk_height).min(height);
+                let y_end: usize = (y_start + chunk_height).min(height); // Fix E0282
 
                 for local_y in 0..(y_end - y_start) {
                     let y = y_start + local_y;
@@ -869,7 +869,7 @@ impl GpuSiftContext {
                         // Symmetric pairs
                         for i in 1..=radius as usize {
                             let top = if y >= i { y - i } else { 0 };
-                            let bottom = (y + i).min(height - 1);
+                            let bottom: usize = (y + i).min(height - 1); // Fix E0282
                             val += (temp[top * width + x] + temp[bottom * width + x])
                                 * kernel[radius as usize + i];
                         }
@@ -990,7 +990,10 @@ impl GpuSiftContext {
             })
             .collect();
 
-        let bytes: Vec<u8> = packed_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes: Vec<u8> = packed_data
+            .iter()
+            .flat_map(|v: &u32| v.to_le_bytes())
+            .collect(); // Fix E0282
         self.queue.write_buffer(&ctx.heap, 0, &bytes);
     }
 
