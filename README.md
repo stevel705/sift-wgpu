@@ -1,6 +1,6 @@
-# SIFT-rs
+# sift-wgpu
 
-A high-performance implementation of SIFT (David G. Lowe's Scale-Invariant Feature Transform) in Rust with CPU and GPU (WebGPU/wgpu) backends.
+A high-performance implementation of SIFT (David G. Lowe's Scale-Invariant Feature Transform) in Rust with CPU and GPU (WebGPU/wgpu) backends. Works out of the box natively and in WASM; ongoing work focuses on further performance improvements.
 
 ## Features
 
@@ -15,7 +15,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sift-rs = "0.1.0"
+sift-wgpu = "0.1.0"
 ```
 
 ## Usage
